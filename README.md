@@ -33,14 +33,21 @@ and are always compiled.
 
 ## What is in the kernel set
 
-44 kernels - the generic ops engines share, plus the machinery to prove
+47 kernels - the generic ops engines share, plus the machinery to prove
 them. Each consumer compiles only the subset it calls:
 
 * **norms** - `rms_norm`, `layer_norm` (one-pass E[x^2]-mean^2 by default, two-pass available), `channel_layer_norm`
+* **NCHW channel ops** - `channel_affine` (the folded-BatchNorm op, with `null`
+  scale or shift and `in` allowed to alias `out`), `channel_scale` (its
+  `shift = null` specialisation, for when the per-channel vector is an
+  *activation* rather than a weight), `channel_mean` (per-channel global average
+  pool, static shared scratch, fixed summation order)
 * **rope** - `rope_neox` (half-split), `rope_2d` (adjacent pairs)
 * **elementwise** - `silu_mul`, `gelu_tanh`, `gelu_erf`, `relu`, `sigmoid`,
   `add`, `add_inplace`, `scale`, `row_affine`, `copy`
-* **reductions** - `argmax`
+* **reductions** - `argmax`, `channel_mean` (per-channel spatial mean, i.e. the
+  global average pool - listed under reductions as well as above because that is
+  what it is)
 * **convolutions** - `conv1x1`, `conv3x3s1p1`, `conv3x3_winograd`
   (F(4x4,3x3), the same op at 4/9ths the multiplies), `conv4x4s4`, `conv_kxk`,
   `linear_1x1`
@@ -84,13 +91,13 @@ cargo run --release --bin gpuinfo
 ```
 
 ```
-driver    : /usr/lib/x86_64-linux-gnu/libcuda.so.1
+driver    : libcuda.so.1
 device    : NVIDIA GeForce GTX 1080 (sm_61)
 SMs       : 20
 smem/block: 49152 bytes
 free VRAM : 7.82 GiB
-fatbin    : 743472 bytes
-kernels   : 44 resolved in the module
+fatbin    : 1123456 bytes
+kernels   : 47 resolved in the module
 launch    : lg_noop(1,1) ok
 cpu twins : ok
 ```
@@ -131,11 +138,14 @@ lightgpu::vm::sync()?;
 
 ## Credits
 
-The kernel set merges work from four engines: LocateAnything-3B (MoonViT +
+The kernel set merges work from five engines: LocateAnything-3B (MoonViT +
 Qwen2 - transformer kernels and the q8_0 path), RMBG-2.0 (BiRefNet - vision
 kernels), Real-ESRGAN (RRDBNet - the F(4x4,3x3) Winograd convolution and the
-vision I/O ops) and lama-inpaint-rs (big-lama - the batched 2-D Fourier
-transforms, which replaced its own in-tree FFT so that no engine needs cuFFT).
+vision I/O ops), lama-inpaint-rs (big-lama - the batched 2-D Fourier
+transforms, which replaced its own in-tree FFT so that no engine needs cuFFT)
+and maxim-rs (MAXIM-2S Enhancement/LOL - the NCHW per-channel affine and global
+average pool, plus the plain ReLU/`shift = null` scale contracts their ops
+turned out to share).
 Model weights are not included: this crate is only the toolkit.
 
 ## Embedding only the kernels you call

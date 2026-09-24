@@ -249,6 +249,8 @@ extern "C" __global__ void lg_gelu_erf(
     y[i] = 0.5f * v * (1.0f + la_erf(v * 0.70710678118654752440f));
 }
 
+// y = max(x, 0), elementwise over n elements. Unlike `lg_lrelu` this carries no
+// slope argument, so it is the plain ReLU the vision path applies after a conv.
 extern "C" __global__ void lg_relu(
     const float *__restrict__ x, float *__restrict__ y, int n)
 {
@@ -258,6 +260,11 @@ extern "C" __global__ void lg_relu(
     y[i] = v < 0.0f ? 0.0f : v;
 }
 
+// y = 1 / (1 + exp(-x)), elementwise over n elements. Standalone on purpose:
+// MAXIM's CALayer, lama's output layer and rmbg's attention all need a sigmoid
+// as its own op rather than folded into a fused kernel. `x` may alias `y` - the
+// kernel reads element i and writes element i and nothing else, so an in-place
+// call is just the same pointer twice (lama-inpaint-rs launches it that way).
 extern "C" __global__ void lg_sigmoid(
     const float *__restrict__ x, float *__restrict__ y, int n)
 {
@@ -357,6 +364,55 @@ extern "C" __global__ void lg_channel_layer_norm(
     }
 }
 
+// NCHW per-CHANNEL affine: out[c][p] = in[c][p] * scale[c] + shift[c], p running
+// over the contiguous hw of each channel.
+//
+// PROMOTED from rmbg-rs's cuda/swin.cu, where it was named as toolkit API in
+// this file and in CONVENTIONS.md while living in a consumer - the drift that
+// motivated this pass. It is the op an NCHW engine needs after folding a
+// BatchNorm, and it is NOT expressible with lg_row_affine: that one indexes its
+// vector by the CONTIGUOUS dimension, which for NCHW is the width, not the
+// channel. See the correction on lg_row_affine.
+//
+// Either parameter may be null for a pure scale (shift = null) or a pure bias
+// (scale = null, then scale[c] = 1). `in` may alias `out`: element idx reads and
+// writes only idx, and the channel index is derived from idx itself, so a call
+// with out == in is safe and is the form an in-place folded BatchNorm wants.
+extern "C" __global__ void lg_channel_affine(
+    const float *__restrict__ in, float *__restrict__ out,
+    const float *__restrict__ scale, const float *__restrict__ shift,
+    int c, int hw)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)c * hw;
+    if (idx >= total) return;
+    const int ch = (int)(idx / hw);
+    float v = in[idx] * (scale ? scale[ch] : 1.0f);
+    if (shift) v += shift[ch];
+    out[idx] = v;
+}
+
+// out[c][p] = in[c][p] * s[c] - the `shift = null` case of lg_channel_affine,
+// kept as its own entry point rather than folded into it.
+//
+// MERGE DECISION: they are the same operation, so one kernel with an optional
+// shift would do; two are kept because the scale-only callers (MAXIM's CALayer
+// `x * sigmoid(y)`, whose s is an ACTIVATION buffer that must not be confused
+// with a weight) already build the three-pointer list (in, s, out), and a
+// variant that reads the affine's `(in, out, scale, shift, ...)` argument order
+// would be a call-site hazard for no gain. lg_channel_scale is the documented
+// specialisation; lg_channel_affine is the general form.
+extern "C" __global__ void lg_channel_scale(
+    const float *__restrict__ in, const float *__restrict__ s, float *__restrict__ out,
+    int c, int hw)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)c * hw;
+    if (idx >= total) return;
+    const int ch = (int)(idx / hw);
+    out[idx] = in[idx] * s[ch];
+}
+
 // y = x, n elements. Kept as a kernel because engines use it to make an
 // explicit device-side copy when they cannot alias the buffer.
 extern "C" __global__ void lg_copy(
@@ -369,6 +425,62 @@ extern "C" __global__ void lg_copy(
 // ===========================================================================
 // 5. Reductions
 // ===========================================================================
+
+// Mean over the spatial plane, per channel: out[c] = mean_p in[c][p]  (NCHW,
+// one block per channel, grid = (c, 1, 1), block <= 1024).
+//
+// The CALayer's global average pool; rmbg's `global_avg_pool` is the same op at
+// the same place in its BiRefNet backbone.
+//
+// SUMMATION ORDER IS PART OF THE CONTRACT - this is what a naive merge would
+// have changed silently. rmbg's copy was a strided loop plus a halving tree and
+// its comment claimed a left-to-right result that its own tree did not produce;
+// MAXIM's was one thread per channel with a pure serial loop, so it agreed with
+// a left-to-right CPU sum and rmbg's did not. The order here is:
+//
+//   1. every one of the 1024 scratch slots is zeroed, then
+//   2. thread `t` accumulates its own strided partial in slot `t`:
+//      r[t] = sum of p[t], p[t + blockDim], p[t + 2*blockDim], ...
+//   3. a halving tree over the FULL 1024 slots (r[t] += r[t + s] for s from 512
+//      down to 1) reduces them,
+//   4. thread 0 writes r[0] / hw.
+//
+// The tree runs over 1024 slots regardless of blockDim, so it needs no
+// power-of-two block and no special case for an odd count: the zeroed tail is
+// the padding, and adding zeros cannot change the value. Sizing the tree to the
+// actual block instead would have to handle an unpaired trailing partial, and
+// the obvious way to write that (`else if (t == half) r[half - 1] += r[half]`)
+// is a RACE: the thread that owns slot `half` writes r[half - 1] while its
+// owner, still alive in that step, reads r[half].
+//
+// The CPU twin (`cpu::channel_mean`) takes the block size as a parameter and
+// reproduces steps 2 and 3 exactly, so the two backends agree bit for bit and a
+// difference is a bug rather than a reordering.
+//
+// Scratch is STATIC and sized for the largest legal blockDim (1024):
+// docs/MAINTAINING.md's rule that a shared kernel must not acquire a requirement
+// its callers satisfy implicitly. rmbg's old call site passed `threads * 4` bytes
+// of dynamic shared memory, which this version does not need - the call site
+// drops its `.shared(...)` and nothing else changes.
+extern "C" __global__ void lg_channel_mean(
+    const float *__restrict__ x, float *__restrict__ out, int c, int hw)
+{
+    __shared__ float r[1024];
+    const int ch = blockIdx.x;
+    if (ch >= c) return;  // uniform per block: blockIdx.x only, so no early exit
+                          // can split a __syncthreads below
+    const int t = threadIdx.x;
+    const float *p = x + (size_t)ch * hw;
+    for (int i = t; i < 1024; i += blockDim.x) r[i] = 0.0f;
+    __syncthreads();
+    for (int i = t; i < hw; i += blockDim.x) r[t] += p[i];
+    __syncthreads();
+    for (int s = 512; s > 0; s >>= 1) {
+        if (t < s) r[t] += r[t + s];
+        __syncthreads();
+    }
+    if (t == 0) out[ch] = r[0] / (float)hw;
+}
 
 // Argmax over the ne0 rows of a [ne0, ncols] buffer, one block per column.
 // Also writes the max value.

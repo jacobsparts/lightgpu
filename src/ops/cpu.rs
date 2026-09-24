@@ -121,6 +121,70 @@ pub fn channel_layer_norm(
     }
 }
 
+/// `lg_channel_affine`: the NCHW per-CHANNEL affine, out[c][p] = in[c][p] *
+/// scale[c] + shift[c]. Either vector may be empty for a pure scale (no shift)
+/// or a pure bias (no scale); `in` and `y` may be the same slice.
+pub fn channel_affine(
+    x: &[f32],
+    scale: &[f32],
+    shift: &[f32],
+    y: &mut [f32],
+    c: usize,
+    hw: usize,
+) {
+    for ch in 0..c {
+        let s = if scale.is_empty() { 1.0f32 } else { scale[ch] };
+        let b = if shift.is_empty() { 0.0f32 } else { shift[ch] };
+        for p in 0..hw {
+            let i = ch * hw + p;
+            y[i] = x[i] * s + b;
+        }
+    }
+}
+
+/// `lg_channel_scale`: the `shift = null` case of [`channel_affine`], as the
+/// kernel is a separate entry point for it.
+pub fn channel_scale(x: &[f32], s: &[f32], y: &mut [f32], c: usize, hw: usize) {
+    for ch in 0..c {
+        for p in 0..hw {
+            let i = ch * hw + p;
+            y[i] = x[i] * s[ch];
+        }
+    }
+}
+
+/// `lg_channel_mean`: out[c] = mean over the hw plane of channel c.
+///
+/// This mirrors the KERNEL's arithmetic rather than a scalar left-to-right sum,
+/// and `block` is a parameter for exactly that reason: the kernel's scratch is
+/// 1024 slots, each thread accumulates its own strided partial into slot
+/// `threadIdx.x`, and the tree then sums slots 0..1024 in a fixed (non-scalar)
+/// order. Reproducing it here means the GPU and CPU results agree bit for bit,
+/// so `selftest` can assert equality instead of a tolerance. The zeroed tail
+/// above `block` contributes nothing, so folding it in is a no-op.
+pub fn channel_mean(x: &[f32], out: &mut [f32], c: usize, hw: usize, block: usize) {
+    for ch in 0..c {
+        let mut r = [0.0f32; 1024];
+        for t in 0..block {
+            let mut s = 0.0f32;
+            let mut i = t;
+            while i < hw {
+                s += x[ch * hw + i];
+                i += block;
+            }
+            r[t] = s;
+        }
+        let mut step = 512;
+        while step > 0 {
+            for t in 0..step {
+                r[t] += r[t + step];
+            }
+            step >>= 1;
+        }
+        out[ch] = r[0] / hw as f32;
+    }
+}
+
 /// `lg_layer_norm`: the two-pass form, matching the kernel.
 pub fn layer_norm(
     x: &[f32],
@@ -397,6 +461,82 @@ pub fn selftest() -> Result<(), String> {
         for i in 0..spec.len() {
             if (spec2[i] - spec[i] * s).abs() > 1e-4 {
                 return Err(format!("fft ortho scale at {i}: {} != {}", spec2[i], spec[i] * s));
+            }
+        }
+    }
+    // Channel affine / scale / mean, the three ops promoted from rmbg's and
+    // MAXIM's own files. c=2, hw=3 with distinct per-channel vectors, so a
+    // transposed scale/shift vector or an off-by-one in the channel index is
+    // visible rather than masked by a uniform value.
+    {
+        let x = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let sc = [10.0f32, 100.0];
+        let sh = [1.0f32, 2.0];
+        let mut y = [0.0f32; 6];
+        channel_affine(&x, &sc, &sh, &mut y, 2, 3);
+        let expect = [11.0f32, 21.0, 31.0, 402.0, 502.0, 602.0];
+        for (i, (g, e)) in y.iter().zip(expect.iter()).enumerate() {
+            if (g - e).abs() > 1e-6 {
+                return Err(format!("channel_affine[{i}] = {g}, expected {e}"));
+            }
+        }
+        // A null shift and a null scale are the two documented specialisations.
+        let mut y2 = [0.0f32; 6];
+        channel_affine(&x, &sc, &[], &mut y2, 2, 3);
+        for (i, (g, e)) in y2.iter().zip([10.0f32, 20.0, 30.0, 400.0, 500.0, 600.0].iter()).enumerate() {
+            if (g - e).abs() > 1e-6 {
+                return Err(format!("channel_affine(no shift)[{i}] = {g}, expected {e}"));
+            }
+        }
+        let mut y3 = [0.0f32; 6];
+        channel_affine(&x, &[], &sh, &mut y3, 2, 3);
+        for (i, (g, e)) in y3.iter().zip([2.0f32, 3.0, 4.0, 6.0, 7.0, 8.0].iter()).enumerate() {
+            if (g - e).abs() > 1e-6 {
+                return Err(format!("channel_affine(no scale)[{i}] = {g}, expected {e}"));
+            }
+        }
+        // channel_scale must be exactly channel_affine with no shift.
+        let mut y4 = [0.0f32; 6];
+        channel_scale(&x, &sc, &mut y4, 2, 3);
+        if y4 != y2 {
+            return Err(format!("channel_scale {y4:?} != channel_affine(no shift) {y2:?}"));
+        }
+        // In-place: the kernel documents that `in` may alias `out`, which is the
+        // folded-BatchNorm form. Same answer as the out-of-place call.
+        let mut alias = x;
+        let want = y;
+        for i in 0..6 {
+            let v = alias[i] * sc[i / 3] + sh[i / 3];
+            alias[i] = v;
+        }
+        if alias != want {
+            return Err("channel_affine in-place differs from out-of-place".into());
+        }
+
+        // channel_mean: the twin mirrors the KERNEL's partial order, so the
+        // block size is a parameter. block = 1 is the pure serial sum; a large
+        // block is the GPU's shape. They must agree to within rounding, and the
+        // non-multiple hw (5 against block 4) is the case a wrong tree would
+        // break by dropping or double-counting an element.
+        let m = [1.0f32, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 30.0];
+        let mut mo1 = [0.0f32; 2];
+        channel_mean(&m, &mut mo1, 2, 4, 1);
+        let mut mk = [0.0f32; 2];
+        channel_mean(&m, &mut mk, 2, 4, 1024);
+        for ch in 0..2 {
+            let want = m[ch * 4..ch * 4 + 4].iter().sum::<f32>() / 4.0;
+            if (mo1[ch] - want).abs() > 1e-6 {
+                return Err(format!("channel_mean(block 1)[{ch}] = {}, expected {want}", mo1[ch]));
+            }
+            if (mk[ch] - want).abs() > 1e-6 {
+                return Err(format!("channel_mean(block 1024)[{ch}] = {}, expected {want}", mk[ch]));
+            }
+        }
+        let mut mo = [0.0f32; 2];
+        channel_mean(&m, &mut mo, 2, 4, 3);  // an odd block, the assymetric case
+        for ch in 0..2 {
+            if (mo[ch] - mo1[ch]).abs() > 1e-6 {
+                return Err(format!("channel_mean is block-dependent: {} vs {}", mo[ch], mo1[ch]));
             }
         }
     }
