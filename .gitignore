@@ -1,0 +1,6 @@
+target/
+
+# The lock is not tracked: this is a library plus binaries that consume it by
+# git, and the point is to build against the toolkit as it stands rather than a
+# frozen revision. Cargo resolves the current tip on every build.
+Cargo.lock

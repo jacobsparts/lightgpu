@@ -1,0 +1,28 @@
+[workspace]
+members = ["build-support"]
+
+[package]
+name = "lightgpu"
+version = "0.1.0"
+edition = "2021"
+description = "Dependency-light CUDA driver layer, kernel set and CPU twins for inference engines"
+license = "MIT"
+repository = "https://github.com/jacobsparts/lightgpu"
+readme = "README.md"
+
+# `links` makes this crate's build-script output visible to dependents as
+# `DEP_LIGHTGPU_*` (with a build-order guarantee) - that is how a consumer's
+# build script finds `cuda/kernels.cu` without guessing at relative paths.
+links = "lightgpu"
+
+[features]
+default = ["cuda"]
+# Compiles cuda/kernels.cu into the embedded fatbin. Without it the crate is a
+# pure-Rust CPU build that needs no CUDA toolchain.
+cuda = []
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+lightgpu-build = { path = "build-support" }
