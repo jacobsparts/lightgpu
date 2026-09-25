@@ -56,3 +56,36 @@ input and the output the upstream reference implementation produced from it -
 kept with the consumer and checked by its own test suite. Backend agreement is a
 debugging aid, not the correctness record: it cannot see a mistake both backends
 share, and a number in a README with no command behind it is not evidence at all.
+
+## Reading a result back
+
+Download the buffer a caller can actually see, not the arena it happens to live
+in. The rule is the same one that governs launches: the cost should be sized to
+what the caller will read.
+
+The failure mode this prevents is silent in development and expensive in use. In
+this family the activations of a whole forward pass live in one device arena, and
+downloading "the arena, because the output is somewhere inside it" works - every
+test passes, every image comes out right - while moving orders of magnitude more
+bytes than any caller reads. On MAXIM's 600x400 fixture the arena is 942.7 MiB and
+the output image is 2.8 MiB, and the extra transfer was 0.4 s of a 1.9 s run and
+~970 MiB of resident host memory, because the host side has to materialise whatever
+it asks the device for.
+
+Both halves matter, and the host half is the one that is easy to miss:
+
+* transfer only the range `[offs[id], offs[id] + len(bufs[id]))` of the buffer the
+  caller wants, the way `realesrgan-rs` and `rmbg-rs` `download` a single `Buf`,
+  `lama-rs` downloads `out.buf`, and `locate-anything-rs` replaces a 610 KB round
+  trip with an 8-byte readback where 8 bytes is all the caller needs;
+* allocate the host arena to the size of what will be read into it. A `Vec` sized
+  for the device arena is not free even when nothing looks at it: pages are faulted
+  in on write, so the allocation - not the read - is what shows up in RSS and in
+  system time.
+
+The arena is a DEVICE-side layout: its size is a property of how the graph packs
+activations, not of what the engine produces. A per-op comparison harness, or a
+debug dump that names intermediate activations, legitimately wants all of it, and
+should say so at the site where it reads - an explicit whole-arena read on the dump
+path is clearer and cheaper than paying for it on every run. What should never
+happen is a normal inference quietly paying for the dump path's convenience.

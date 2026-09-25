@@ -354,36 +354,55 @@ extern "C" __global__ void lg_row_affine(
 // CONTIGUOUS ne0 within each row (the last-axis case, xr = x + r*ne0), and for
 // an NCHW tensor whose contiguous dimension is hw the two differ as soon as
 // hw > 1 - lg_layer_norm would then sum across channels of the wrong axis.
-// One block per spatial position; the gather is strided by hw.
+//
+// ONE THREAD PER SPATIAL POSITION, each walking the c values serially, and no
+// shared memory. Nothing here needs a block: the reduction is over c, which the
+// same thread can do better than a block can.
+//
+// THIS REPLACED a one-BLOCK-per-spatial-position form: grid (hw, 1, 1), the c
+// values reduced by a halving tree over 1024-slot shared arrays r1[]/r2[]. It
+// was launched with blockDim 256 and MAXIM's c is 32, so 224 of the 256 threads
+// accumulated nothing and then idled through an 8-step tree to collapse 32 live
+// values - and the gather `xp[i * hw]` is strided by the whole plane, so a warp
+// asked for 32 separate cache lines instead of one. Measured on the GTX 1080 at
+// c=32, hw=286720 (MAXIM's largest shape):
+//     block-per-position   4.17-4.29 ms/launch    25.7 GB/s
+//     this form            0.470 ms/launch      234 GB/s        (8.9x)
+// and 4.5x / 3.0x / 8.3x at the shapes below it (c=64 hw=71680, c=128 hw=17920,
+// c=32 hw=16384). Consecutive threads now read consecutive `p` for the same
+// channel, so each (channel, warp) load is one coalesced transaction.
+//
+// THE SUMMATION ORDER IS THEREFORE SERIAL AND ASCENDING OVER c, where the old
+// form's was a tree. That is a last-bit difference (measured: 2030138 of
+// 9175040 elements at c=32 hw=286720, worst 4.77e-07 - one ulp) and no comment
+// here ever promised the tree, so this is not a documented contract being
+// broken. It is still a behaviour change, and it is deliberate: an engine whose
+// CPU twin reproduces the old tree order now differs from this kernel in the
+// last bit, and its twin should be treated as the thing to update, since a
+// serial sum is both faster here and the ordinary order for a scalar reference.
+// (Contrast lg_channel_mean, whose summation order IS contractual and is written
+// out below for that reason.)
 extern "C" __global__ void lg_channel_layer_norm(
     const float *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b,
     float *__restrict__ y, int c, int hw, float eps)
 {
-    // Fixed arrays sized to the LARGEST legal blockDim (1024), so the caller
-    // need not pass any shared memory - consistent with every other reduction
-    // in this file.
-    __shared__ float r1[1024], r2[1024];
-    const int p = blockIdx.x;
+    const long p = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= hw) return;
     const float *xp = x + p;
     float *yp = y + p;
     float s1 = 0.f, s2 = 0.f;
-    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+    for (int i = 0; i < c; ++i) {
         const float v = xp[(size_t)i * hw];
         s1 += v;
         s2 += v * v;
     }
-    r1[threadIdx.x] = s1; r2[threadIdx.x] = s2;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) { r1[threadIdx.x] += r1[threadIdx.x + s]; r2[threadIdx.x] += r2[threadIdx.x + s]; }
-        __syncthreads();
-    }
     const float n = (float)c;
-    const float mean = r1[0] / n;
-    const float var = r2[0] / n - mean * mean;
+    const float mean = s1 / n;
+    // One-pass E[x^2] - mean^2, as this kernel has always used: the two-pass
+    // form is numerically better but would be a second, larger change.
+    const float var = s2 / n - mean * mean;
     const float scale = rsqrtf(fmaxf(var, 0.f) + eps);
-    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+    for (int i = 0; i < c; ++i) {
         const size_t o = (size_t)i * hw;
         yp[o] = (xp[o] - mean) * scale * w[i] + b[i];
     }

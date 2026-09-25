@@ -79,6 +79,11 @@ pub type FnModuleGetFunction =
 pub type FnModuleUnload = unsafe extern "C" fn(CUmodule) -> CUresult;
 pub type FnMemAlloc = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 pub type FnMemFree = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
+/// `cuMemGetAddressRange`: the base and size of the allocation containing an
+/// address. The driver's own answer to "is this pointer one of mine", which a
+/// caller cannot infer from a `CUdeviceptr` alone.
+pub type FnMemGetAddressRange =
+    unsafe extern "C" fn(*mut CUdeviceptr, *mut usize, CUdeviceptr) -> CUresult;
 /// `cuMemAllocHost` / `cuMemFreeHost`: page-locked host staging buffers.
 pub type FnMemAllocHost = unsafe extern "C" fn(*mut *mut c_void, usize) -> CUresult;
 pub type FnMemFreeHost = unsafe extern "C" fn(*mut c_void) -> CUresult;
@@ -129,6 +134,7 @@ pub struct Driver {
     pub cuModuleUnload: FnModuleUnload,
     pub cuMemAlloc: FnMemAlloc,
     pub cuMemFree: FnMemFree,
+    pub cuMemGetAddressRange: FnMemGetAddressRange,
     pub cuMemAllocHost: FnMemAllocHost,
     pub cuMemFreeHost: FnMemFreeHost,
     pub cuMemcpyHtoD: FnMemcpyHtoD,
@@ -178,6 +184,7 @@ forward! {
     cuMemAllocHost(p: *mut *mut c_void, n: usize) -> CUresult;
     cuMemFreeHost(p: *mut c_void) -> CUresult;
     cuMemFree(p: CUdeviceptr) -> CUresult;
+    cuMemGetAddressRange(b: *mut CUdeviceptr, n: *mut usize, p: CUdeviceptr) -> CUresult;
     cuMemcpyHtoD(d: CUdeviceptr, s: *const c_void, n: usize) -> CUresult;
     cuMemcpyDtoH(d: *mut c_void, s: CUdeviceptr, n: usize) -> CUresult;
     cuMemcpyDtoD(d: CUdeviceptr, s: CUdeviceptr, n: usize) -> CUresult;
@@ -307,6 +314,11 @@ pub fn driver() -> Result<&'static Driver, String> {
             cuModuleUnload: s!("cuModuleUnload", "cuModuleUnload", FnModuleUnload),
             cuMemAlloc: s!("cuMemAlloc_v2", "cuMemAlloc", FnMemAlloc),
             cuMemFree: s!("cuMemFree_v2", "cuMemFree", FnMemFree),
+            cuMemGetAddressRange: s!(
+                "cuMemGetAddressRange_v2",
+                "cuMemGetAddressRange",
+                FnMemGetAddressRange
+            ),
             cuMemAllocHost: s!("cuMemAllocHost_v2", "cuMemAllocHost", FnMemAllocHost),
             cuMemFreeHost: s!("cuMemFreeHost_v2", "cuMemFreeHost", FnMemFreeHost),
             cuMemcpyHtoD: s!("cuMemcpyHtoD_v2", "cuMemcpyHtoD", FnMemcpyHtoD),

@@ -214,6 +214,7 @@ impl DevBuf {
         let d = ffi::driver()?;
         let mut ptr: CUdeviceptr = 0;
         ffi::chk(d.cuMemAlloc(&mut ptr, bytes.max(1)), "cuMemAlloc")?;
+        trace_io("alloc", format!("ptr=0x{ptr:x} bytes={bytes}"));
         Ok(DevBuf { ptr, bytes })
     }
 
@@ -230,6 +231,7 @@ impl DevBuf {
     pub fn zeros(bytes: usize) -> Result<DevBuf, String> {
         let b = DevBuf::alloc(bytes)?;
         let d = ffi::driver()?;
+        trace_io("memset_zero", format!("ptr=0x{:x} bytes={bytes}", b.ptr));
         ffi::chk(d.cuMemsetD8(b.ptr, 0, bytes.max(1)), "cuMemsetD8")?;
         Ok(b)
     }
@@ -248,6 +250,11 @@ impl DevBuf {
         let d = ffi::driver()?;
         let bytes = std::mem::size_of_val(out);
         assert!(bytes <= self.bytes, "download of {bytes} bytes from {}", self.bytes);
+        // TRACED HERE TOO, and it matters: this path calls the driver directly
+        // rather than through `copy_dtoh`, so before this line every `snap`
+        // download was invisible to LIGHTGPU_TRACE_IO - which made a passing and
+        // a failing run look call-for-call identical.
+        trace_io("download", format!("src=0x{:x} bytes={bytes}", self.ptr));
         ffi::chk(
             d.cuMemcpyDtoH(out.as_mut_ptr() as *mut c_void, self.ptr, bytes),
             "cuMemcpyDtoH",
@@ -257,6 +264,17 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
+        if std::env::var("LIGHTGPU_TRACE_FREE").is_ok() {
+            eprintln!("lightgpu: free 0x{:x} ({} bytes)", self.ptr, self.bytes);
+        }
+        // WHO IS FREEING THIS, when asked. `cuMemFree` on a pointer that is
+        // still live elsewhere removes the entry from the driver's address
+        // table rather than failing, so the only way to find the offending
+        // owner is to name the call site that dropped it.
+        if std::env::var("LIGHTGPU_TRACE_FREE_BT").is_ok() {
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("lightgpu: free 0x{:x} ({} bytes) from\n{bt}", self.ptr, self.bytes);
+        }
         if let Ok(d) = ffi::driver() {
             d.cuMemFree(self.ptr);
         }
@@ -401,6 +419,13 @@ impl Args {
 
     pub fn launch(&mut self, m: &Module, kernel: &str, l: Launch) -> Result<(), String> {
         let d = ffi::driver()?;
+        trace_io(
+            "launch",
+            format!(
+                "{kernel} grid=({},{},{}) block=({},{},{}) args={}",
+                l.grid.0, l.grid.1, l.grid.2, l.block.0, l.block.1, l.block.2, self.slots.len()
+            ),
+        );
         let f = m.func(kernel)?;
         let r: CUresult = d.cuLaunchKernel(
             f,
@@ -472,6 +497,7 @@ pub fn copy_htod_staged(dst: CUdeviceptr, src: &[u8], stage: &mut Staging) -> Re
 pub fn copy_dtoh(dst: &mut [u8], src: CUdeviceptr) -> Result<(), String> {
     init()?;
     let d = ffi::driver()?;
+    trace_io("copy_dtoh", format!("src=0x{src:x} bytes={}", dst.len()));
     ffi::chk(
         d.cuMemcpyDtoH(dst.as_mut_ptr() as *mut c_void, src, dst.len()),
         "cuMemcpyDtoH",
@@ -481,7 +507,87 @@ pub fn copy_dtoh(dst: &mut [u8], src: CUdeviceptr) -> Result<(), String> {
 /// Device-to-device copy (KV-cache appends and similar).
 pub fn copy_d2d(dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> Result<(), String> {
     let d = ffi::driver()?;
+    trace_io("copy_d2d", format!("dst=0x{dst:x} src=0x{src:x} bytes={bytes}"));
+    // What the DRIVER says about these two addresses at the instant of the
+    // call, and whether either of them is a sub-range of the other. A copy
+    // refused with CUDA_ERROR_INVALID_VALUE while both addresses are live,
+    // correctly sized and readable is otherwise unaccountable: the only
+    // remaining possibility is that the call's own validation disagrees with
+    // the caller's bookkeeping, and this is the pair of facts that shows it.
+    if std::env::var("LIGHTGPU_TRACE_D2D").is_ok() {
+        let describe = |label: &str, p: CUdeviceptr| match devbuf_range(p) {
+            Ok((base, size)) => format!("{label} 0x{p:x} in base 0x{base:x} size {size}"),
+            Err(e) => format!("{label} 0x{p:x} NOT an allocation: {e}"),
+        };
+        eprintln!(
+            "d2d dst=0x{dst:x} src=0x{src:x} bytes={bytes} :: {} :: {}",
+            describe("dst", dst),
+            describe("src", src)
+        );
+    }
     ffi::chk(d.cuMemcpyDtoD(dst, src, bytes), "cuMemcpyDtoD")
+}
+
+/// Zero `bytes` at `ptr`, through the same entry point `DevBuf::zeros` uses.
+///
+/// A MEMSET NEEDS NO ADDRESS-RANGE ENTRY and reads nothing, so it is the
+/// control a `cuMemcpyDtoD` cannot be: if a copy is refused for an address the
+/// driver still reports as live, a memset of that same address says whether the
+/// driver will accept the range at all.
+pub fn memset_d8(ptr: CUdeviceptr, bytes: usize) -> Result<(), String> {
+    init()?;
+    let d = ffi::driver()?;
+    trace_io("memset_d8", format!("ptr=0x{ptr:x} bytes={bytes}"));
+    ffi::chk(d.cuMemsetD8(ptr, 0, bytes.max(1)), "cuMemsetD8")
+}
+
+/// Fill `bytes` at `ptr` with the byte `value` - the same entry point as
+/// `memset_d8`, with the byte a parameter instead of a constant zero.
+///
+/// WHY A NON-ZERO FILL IS WORTH A SECOND FUNCTION: it is how an engine proves a
+/// buffer is written before it is read. Zeroing a scratch allocation hides the
+/// difference between "computed" and "never touched, and happened to start at
+/// zero", so a plan whose staging slots are filled with 0xCD and then produces
+/// byte-identical output has shown that nothing reads uninitialised memory.
+/// `memset_d8` cannot express that - it is the zero case, kept separate because
+/// it is the one that matches `DevBuf::zeros`.
+pub fn memset_u8(ptr: CUdeviceptr, value: u8, bytes: usize) -> Result<(), String> {
+    init()?;
+    let d = ffi::driver()?;
+    trace_io("memset_u8", format!("ptr=0x{ptr:x} value=0x{value:02x} bytes={bytes}"));
+    ffi::chk(d.cuMemsetD8(ptr, value, bytes.max(1)), "cuMemsetD8")
+}
+
+/// The base and size of the allocation containing `ptr`, as the DRIVER sees it.
+///
+/// A `CUdeviceptr` is an opaque integer, and every check a caller can make on it
+/// - non-null, distinct from its neighbours, inside the range it believes it
+/// allocated - is a check on the caller's own bookkeeping. This asks CUDA
+/// instead: `cuMemGetAddressRange` reports the allocation the address belongs
+/// to, and fails if it belongs to none. It is the difference between "my plan
+/// says these are two live buffers" and "the driver agrees".
+///
+/// Read-only: it neither allocates nor copies, so it can be called while
+/// investigating a failure without disturbing what is being investigated.
+pub fn devbuf_range(ptr: CUdeviceptr) -> Result<(CUdeviceptr, usize), String> {
+    init()?;
+    let d = ffi::driver()?;
+    let mut base: CUdeviceptr = 0;
+    let mut size: usize = 0;
+    ffi::chk(d.cuMemGetAddressRange(&mut base, &mut size, ptr), "cuMemGetAddressRange")?;
+    Ok((base, size))
+}
+
+
+/// Print `CUDA-IO: <what> <args>` for every device-touching call, when
+/// `LIGHTGPU_TRACE_IO` is set. Built for diffing two runs' call sequences when
+/// a failure depends on calls a hand-written reproducer does not reproduce.
+pub fn trace_io(what: &str, detail: String) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("LIGHTGPU_TRACE_IO").is_ok()) {
+        eprintln!("CUDA-IO: {what} {detail}");
+    }
 }
 
 /// A CUDA event, for timing a region of device work.
@@ -534,6 +640,7 @@ impl Drop for Event {
 
 /// Wait for all work on the current context to finish.
 pub fn sync() -> Result<(), String> {
+    trace_io("sync", String::new());
     init()?;
     let d = ffi::driver()?;
     ffi::chk(d.cuCtxSynchronize(), "cuCtxSynchronize")
