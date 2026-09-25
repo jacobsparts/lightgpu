@@ -12,14 +12,17 @@ They are the contract; a new kernel that breaks one should say why in a comment.
   cannot pass something as a pointer plus an int cannot use the kernel.
 * `const T *__restrict__` for inputs, `T *__restrict__` for outputs. No kernel
   both reads and writes the same buffer unless it says so: the in-place ops are
-  `lg_silu_mul` and `lg_softmax_rows`, plus `lg_channel_affine`, whose element
-  `idx` reads and writes only `idx` and which the folded-BatchNorm call site
-  invokes with `out == in`.
+  `lg_silu_mul` and `lg_add_inplace` (out-of-place forms need one more buffer of
+  the activation size per layer) plus `lg_channel_affine`, whose element `idx`
+  reads and writes only `idx` and which the folded-BatchNorm call site invokes
+  with `out == in`.
 * Sizes as `int` when the element count provably fits in 2^31 (any single
   tensor in these models does), `long` when a caller could pass a batch that
-  overflows (`lg_copy`, `lg_mul_broadcast`, the conv family, the gather pair).
-  Getting this wrong fails silently on large inputs, so it is per-kernel, not
-  per-file.
+  overflows (`lg_copy`, the conv family, the gather pair). Getting this wrong
+  fails silently on large inputs - reading a length from a `long` slot when the
+  kernel wants an `int` is a wrong number, not an error - so it is per-kernel,
+  not per-file, and a caller moving onto a toolkit kernel must check the width.
+  Moving MAXIM's `mx_mul` (a `long`) onto `lg_mul` (an `int`) is a live example.
 
 ## 2. Layout
 
@@ -44,10 +47,17 @@ Two layouts exist, and every kernel documents which it takes.
 * token layout `[n_tokens][C]`, i.e. row-major with channels innermost - the
   form a patch embed or a linear wants.
 
-Kernels that convert between the two say so in their name
-(`lg_nchw_to_tokens`, `lg_tokens_to_nchw`) rather than assuming a caller's
+Kernels that convert between the two say so in their name (`lg_extract_rows`,
+`lg_merge_2x2`, `lg_pixel_unshuffle2`) rather than assuming a caller's
 convention. A kernel that takes a pitch or a stride parameter must state whether
 the pitch is in elements or bytes.
+
+A name appearing in this document is not necessarily a toolkit kernel: the
+merge-decision table below cites REJECTED candidates and consumer-side kernels by
+name, and six of those (`lg_mul_broadcast`, `lg_softmax_rows`,
+`lg_resize_bilinear`, `lg_patch_merge`, `lg_nchw_to_tokens`, `lg_tokens_to_nchw`)
+live in `rmbg-rs/cuda/swin.cu` and `lg_add_bias` in no repository at all. The
+kernel set is `cuda/kernels.cu` and `src/ops/mod.rs`, and nothing else.
 
 ## 3. Merging decisions
 
@@ -59,6 +69,7 @@ better implementation won. The decisions, and why:
 | layer norm variance | two-pass: mean, then variance of `(x - mean)` | one-pass `E[x^2] - mean^2` | the one-pass form cancels catastrophically when the mean is large relative to the spread; the two-pass form is what both engines' CPU twins do |
 | `erf` | Abramowitz & Stegun 7.1.26 | hardware `erff` | the hardware variant differs from a plain Rust CPU twin by more than the pipeline's own error, which blunts the per-op GPU-vs-CPU diff. Same formula on both sides means an erf mismatch can never explain a difference |
 | elementwise | out-of-place `in, out` | in-place | costs nothing, removes an aliasing rule the caller had to know, and lets the input survive for a residual. `lg_silu_mul` stays in-place because the fused gated-MLP path reuses the gate buffer on purpose |
+| elementwise multiply | promoted to the toolkit as `lg_mul(a, b, y, n)` | leaving it where it was, or folding it into a broadcast multiply | generic on the "could another family call this" test, and the GATED architectures do: NAFNet's SimpleGate multiplies the two halves of a channel split and MAXIM's gMLP multiplies a gate by a value. It is not `lg_silu_mul` (fused, in place, consumes its gate) and not `lg_mul_broadcast`, which scales every channel by one shared spatial map and at `hw == 1` is the scalar `a[0]` - the two are not the same op and neither subsumes the other |
 | bias add / per-row affine | `lg_row_affine(x, scale, shift, ne0, nrows)` | `add_bias` | `lg_add_bias` is `lg_row_affine` with `scale = null`. The vector is indexed by the **contiguous** dimension, so this covers a bias add and a last-axis affine. |
 | NCHW per-channel affine | `lg_channel_affine(in, out, scale, shift, c, hw)` | `affine_channels` | **CORRECTION.** An earlier note claimed `lg_row_affine` subsumes the NCHW channel affine with the caller's layout choice. It does not: this op indexes its vector by **channel** and applies it across each channel's contiguous `hw`, and no choice of `ne0`/`nrows` reproduces that, because NCHW fixes which dimension is contiguous. Two kernels. Either parameter may be null; `in` may alias `out`. |
 | conv | specialised `lg_conv3x3s1p1` plus generic `lg_conv_kxk` | routing everything through the generic path | the 3x3 is BiRefNet's hot path and its specialised index arithmetic is measurably better |

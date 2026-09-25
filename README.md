@@ -33,7 +33,7 @@ and are always compiled.
 
 ## What is in the kernel set
 
-47 kernels - the generic ops engines share, plus the machinery to prove
+48 kernels - the generic ops engines share, plus the machinery to prove
 them. Each consumer compiles only the subset it calls:
 
 * **norms** - `rms_norm`, `layer_norm` (one-pass E[x^2]-mean^2 by default, two-pass available), `channel_layer_norm`
@@ -44,7 +44,8 @@ them. Each consumer compiles only the subset it calls:
   pool, static shared scratch, fixed summation order)
 * **rope** - `rope_neox` (half-split), `rope_2d` (adjacent pairs)
 * **elementwise** - `silu_mul`, `gelu_tanh`, `gelu_erf`, `relu`, `sigmoid`,
-  `add`, `add_inplace`, `scale`, `row_affine`, `copy`
+  `add`, `mul`, `add_inplace`, `scale`, `row_affine`, `copy` (`mul` is the
+  product the gated architectures need: NAFNet's SimpleGate and MAXIM's gMLP)
 * **reductions** - `argmax`, `channel_mean` (per-channel spatial mean, i.e. the
   global average pool - listed under reductions as well as above because that is
   what it is)
@@ -96,8 +97,8 @@ device    : NVIDIA GeForce GTX 1080 (sm_61)
 SMs       : 20
 smem/block: 49152 bytes
 free VRAM : 7.82 GiB
-fatbin    : 1123456 bytes
-kernels   : 47 resolved in the module
+fatbin    : 1128152 bytes
+kernels   : 48 resolved in the module
 launch    : lg_noop(1,1) ok
 cpu twins : ok
 ```

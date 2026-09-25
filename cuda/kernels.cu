@@ -285,6 +285,27 @@ extern "C" __global__ void lg_add(
     if (i < n) y[i] = a[i] + b[i];
 }
 
+// y = a * b, whole-plane, elementwise. The multiplicative twin of `lg_add` and
+// the plainest op there is, but it had no home in the toolkit: the one engine
+// that needed it shipped its own copy (MAXIM's `mx_mul`), because nothing in
+// the transformer engines needed a multiply. It is NOT
+// `lg_silu_mul` (which is a fused gated-MLP step, in place, and consumes its
+// gate), and it is NOT `lg_mul_broadcast`, which is a different op: that one
+// multiplies every channel by ONE shared spatial map (`x[i] *= a[i % hw]`),
+// and at hw == 1 it would multiply by the scalar `a[0]` rather than elementwise.
+//
+// The callers this is for are the gated architectures: NAFNet's SimpleGate
+// splits the channels in half and multiplies the halves, and MAXIM's gMLP
+// multiplies a gate by a value. `int n` rather than `long`, like `lg_add` and
+// `lg_scale` beside it: a single plane is the largest operand any of these
+// models produces, and none of them approaches 2^31 elements.
+extern "C" __global__ void lg_mul(
+    const float *__restrict__ a, const float *__restrict__ b, float *__restrict__ y, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a[i] * b[i];
+}
+
 // y += x, in place. The second in-place op in this file, and for the same
 // reason as `lg_silu_mul`: a residual accumulate where an out-of-place form
 // would need one more buffer of the activation size per layer.

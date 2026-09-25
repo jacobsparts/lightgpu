@@ -15,6 +15,13 @@ pub fn add(a: &[f32], b: &[f32], y: &mut [f32]) {
     }
 }
 
+/// `lg_mul`: y = a * b
+pub fn mul(a: &[f32], b: &[f32], y: &mut [f32]) {
+    for i in 0..a.len() {
+        y[i] = a[i] * b[i];
+    }
+}
+
 /// `lg_scale`: y = x * s
 pub fn scale(x: &[f32], s: f32, y: &mut [f32]) {
     for i in 0..x.len() {
@@ -466,6 +473,36 @@ pub fn selftest() -> Result<(), String> {
             }
         }
     }
+    // lg_mul: the elementwise product, including the out-of-place contract (the
+    // inputs must survive, which is what separates it from lg_silu_mul) and
+    // negatives, so a `max(0, ...)`-style mistake cannot pass.
+    {
+        let a = [1.0f32, -2.0, 3.0, -4.0];
+        let b = [5.0f32, 6.0, -7.0, -8.0];
+        let mut y = [0.0f32; 4];
+        mul(&a, &b, &mut y);
+        let expect = [5.0f32, -12.0, -21.0, 32.0];
+        for (i, (g, e)) in y.iter().zip(expect.iter()).enumerate() {
+            if g != e {
+                return Err(format!("mul[{i}] = {g}, expected {e}"));
+            }
+        }
+        if a != [1.0f32, -2.0, 3.0, -4.0] || b != [5.0f32, 6.0, -7.0, -8.0] {
+            return Err("mul modified its inputs".into());
+        }
+        // A length that is not a multiple of any block size: the kernel's guard
+        // is `i < n` on an `int`, and the twin iterates the slice it is given.
+        let a5 = [2.0f32, 2.0, 2.0, 2.0, 2.0];
+        let b5 = [3.0f32, 0.5, -1.0, 0.0, 100.0];
+        let mut y5 = [0.0f32; 5];
+        mul(&a5, &b5, &mut y5);
+        for (i, (g, e)) in y5.iter().zip([6.0f32, 1.0, -2.0, 0.0, 200.0].iter()).enumerate() {
+            if g != e {
+                return Err(format!("mul(odd length)[{i}] = {g}, expected {e}"));
+            }
+        }
+    }
+
     // Channel affine / scale / mean, the three ops promoted from rmbg's and
     // MAXIM's own files. c=2, hw=3 with distinct per-channel vectors, so a
     // transposed scale/shift vector or an off-by-one in the channel index is

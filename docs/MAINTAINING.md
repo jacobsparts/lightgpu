@@ -32,6 +32,15 @@ The practical test is:
 * does it exist because of one architecture's fusion, layout, or tap order? Keep
   it in the project.
 
+"Plausibly" is deliberately forward-looking and includes work that is planned
+rather than present. A plain elementwise product had exactly one caller in the
+family (`mx_mul`, in MAXIM) and still belongs here, because the gated
+architectures need one on their own terms: NAFNet's SimpleGate multiplies the two
+halves of a channel split, and every gMLP-style block multiplies a gate by a
+value. The test is whether the OPERATION is generic, not whether there are two
+call sites today - and the cost of waiting is a second copy that has to be
+reconciled later, which is the thing this document exists to prevent.
+
 Consumer-specific kernels can be compiled alongside toolkit kernels with
 `lightgpu_build::fatbin_modules`, using one fatbin/module per source file. This
 preserves entry pruning and separate namespaces. See the build helper API and
