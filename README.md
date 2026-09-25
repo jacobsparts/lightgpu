@@ -4,8 +4,9 @@ The toolkit behind the lightgpu inference engines:
 [rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
 [nafnet-rs](https://github.com/jacobsparts/nafnet-rs),
 [locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs),
-[realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs) and
-[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs).
+[realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs),
+[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs) and
+[maxim-rs](https://github.com/jacobsparts/maxim-rs).
 [pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for
 cleaning up product photos that drives all of these engines.
 
