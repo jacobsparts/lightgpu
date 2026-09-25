@@ -260,11 +260,14 @@ extern "C" __global__ void lg_relu(
     y[i] = v < 0.0f ? 0.0f : v;
 }
 
-// y = 1 / (1 + exp(-x)), elementwise over n elements. Standalone on purpose:
-// MAXIM's CALayer, lama's output layer and rmbg's attention all need a sigmoid
-// as its own op rather than folded into a fused kernel. `x` may alias `y` - the
-// kernel reads element i and writes element i and nothing else, so an in-place
-// call is just the same pointer twice (lama-inpaint-rs launches it that way).
+// y = 1 / (1 + __expf(-x)), elementwise over n elements. Standalone rather than
+// folded into a fused kernel, because the engines that need it need it alone.
+// `x` may alias `y`: the kernel reads element i and writes element i and nothing
+// else, so an in-place call is the same pointer twice.
+//
+// NUMERICS: `__expf` is the fast exponential. The CPU twin uses the same form,
+// so the two agree; a caller that needs `expf` bit-exactness wants its own
+// kernel rather than this one.
 extern "C" __global__ void lg_sigmoid(
     const float *__restrict__ x, float *__restrict__ y, int n)
 {
@@ -365,14 +368,12 @@ extern "C" __global__ void lg_channel_layer_norm(
 }
 
 // NCHW per-CHANNEL affine: out[c][p] = in[c][p] * scale[c] + shift[c], p running
-// over the contiguous hw of each channel.
+// over the contiguous hw of each channel. The op an NCHW engine needs after
+// folding a BatchNorm.
 //
-// PROMOTED from rmbg-rs's cuda/swin.cu, where it was named as toolkit API in
-// this file and in CONVENTIONS.md while living in a consumer - the drift that
-// motivated this pass. It is the op an NCHW engine needs after folding a
-// BatchNorm, and it is NOT expressible with lg_row_affine: that one indexes its
-// vector by the CONTIGUOUS dimension, which for NCHW is the width, not the
-// channel. See the correction on lg_row_affine.
+// MERGE DECISION: it is NOT expressible with `lg_row_affine`, which indexes its
+// vector by the CONTIGUOUS dimension - for NCHW that is the width, not the
+// channel. See the correction on `lg_row_affine`.
 //
 // Either parameter may be null for a pure scale (shift = null) or a pure bias
 // (scale = null, then scale[c] = 1). `in` may alias `out`: element idx reads and
@@ -426,17 +427,12 @@ extern "C" __global__ void lg_copy(
 // 5. Reductions
 // ===========================================================================
 
-// Mean over the spatial plane, per channel: out[c] = mean_p in[c][p]  (NCHW,
-// one block per channel, grid = (c, 1, 1), block <= 1024).
+// Mean over the spatial plane, per channel: out[c] = mean_p in[c][p]. NCHW,
+// one block per channel (grid = (c, 1, 1), block <= 1024, no dynamic shared
+// memory), so c can exceed any launchable block size.
 //
-// The CALayer's global average pool; rmbg's `global_avg_pool` is the same op at
-// the same place in its BiRefNet backbone.
-//
-// SUMMATION ORDER IS PART OF THE CONTRACT - this is what a naive merge would
-// have changed silently. rmbg's copy was a strided loop plus a halving tree and
-// its comment claimed a left-to-right result that its own tree did not produce;
-// MAXIM's was one thread per channel with a pure serial loop, so it agreed with
-// a left-to-right CPU sum and rmbg's did not. The order here is:
+// SUMMATION ORDER IS PART OF THE CONTRACT - it is a parity decision, because a
+// reordering here moves a model's last bits with nothing else to show for it:
 //
 //   1. every one of the 1024 scratch slots is zeroed, then
 //   2. thread `t` accumulates its own strided partial in slot `t`:
@@ -455,13 +451,9 @@ extern "C" __global__ void lg_copy(
 //
 // The CPU twin (`cpu::channel_mean`) takes the block size as a parameter and
 // reproduces steps 2 and 3 exactly, so the two backends agree bit for bit and a
-// difference is a bug rather than a reordering.
-//
-// Scratch is STATIC and sized for the largest legal blockDim (1024):
-// docs/MAINTAINING.md's rule that a shared kernel must not acquire a requirement
-// its callers satisfy implicitly. rmbg's old call site passed `threads * 4` bytes
-// of dynamic shared memory, which this version does not need - the call site
-// drops its `.shared(...)` and nothing else changes.
+// difference is a bug rather than a reordering. The scratch is STATIC, sized for
+// the largest legal blockDim: docs/MAINTAINING.md's rule that a shared kernel
+// must not acquire a requirement its callers satisfy implicitly.
 extern "C" __global__ void lg_channel_mean(
     const float *__restrict__ x, float *__restrict__ out, int c, int hw)
 {
