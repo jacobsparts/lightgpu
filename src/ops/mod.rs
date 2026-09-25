@@ -1,7 +1,9 @@
 //! The kernel set, by name, with each op's layout contract.
 //!
 //! The CUDA implementation is `cuda/kernels.cu` (embedded as [`crate::FATBIN`]);
-//! the arithmetic twins are in [`cpu`]. An engine looks kernels up by name, so
+//! the CPU implementations, which keep the same arithmetic so a backend
+//! difference is a real one, are in [`cpu`]. An engine looks kernels up by name,
+//! so
 //! this table is the toolkit's public surface: [`NAMES`] is what
 //! `Module::func` will successfully resolve, and [`OPS`] carries the one-line
 //! contract each op obeys.

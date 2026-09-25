@@ -15,9 +15,10 @@
 //   1. `extern "C"` names with the `lg_` prefix, no app-specific structs, no
 //      globals, raw pointers plus scalars only - so the same file serves any
 //      engine and is looked up by name through the driver API.
-//   2. One definition per op and an indistinguishable arithmetic twin on the
-//      CPU (`src/ops/cpu.rs`). The CPU twin is the reference: a GPU change is
-//      only correct when it still matches the twin.
+//   2. One definition per op and an arithmetic twin on the CPU
+//      (`src/ops/cpu.rs`) that keeps the same order of operations, so a GPU
+//      change that still matches it has not changed the arithmetic. The twin is
+//      also the CPU backend, and is tuned on its own terms.
 //
 // Numerics: no fast math, no flush-to-zero (--ftz=false --prec-div=true
 // --prec-sqrt=true --fmad=true). Reductions keep the same order as the CPU

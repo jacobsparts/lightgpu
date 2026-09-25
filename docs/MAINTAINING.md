@@ -42,4 +42,8 @@ consumer `build.rs` files for the exact invocation.
 The toolkit's self-test and `gpuinfo` completeness check do not replace testing a
 consumer's complete model. A contract mismatch can pass small-tensor checks and
 still fail in a full model. Validate both the shared operation and the consumer
-wrapper, then test the complete engine on its reference fixture.
+wrapper, then test the complete engine on its reference fixture: a golden pair -
+input and the output the upstream reference implementation produced from it -
+kept with the consumer and checked by its own test suite. Backend agreement is a
+debugging aid, not the correctness record: it cannot see a mistake both backends
+share, and a number in a README with no command behind it is not evidence at all.

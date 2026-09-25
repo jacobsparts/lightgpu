@@ -1,10 +1,12 @@
 //! CPU twins of the kernels: same names, same arithmetic, plain Rust.
 //!
-//! These are the reference implementation for the GPU kernels. A GPU change is
-//! only correct when it still agrees with the twins here, so the twins try to
-//! keep the *order* of operations the GPU kernels use where that is cheap, and
-//! the few places where they deliberately differ (erf, layer-norm variance) are
-//! documented at the kernel instead.
+//! These are the CPU backend, not a test harness: this is the path an engine
+//! runs when there is no GPU, and it is held to the same performance standard as
+//! the kernels it mirrors. Keeping the *order* of operations the GPU kernels use,
+//! wherever that is cheap, is what makes a backend mismatch mean a real
+//! difference rather than a rounding one; it is not a reason to leave the CPU
+//! side slow. The few places where the two deliberately differ (erf, layer-norm
+//! variance) are documented at the kernel instead.
 
 /// `lg_add`: y = a + b
 pub fn add(a: &[f32], b: &[f32], y: &mut [f32]) {
@@ -230,7 +232,7 @@ pub fn rms_norm(x: &[f32], w: &[f32], y: &mut [f32], ne0: usize, nrows: usize, e
 /// `1/sqrt(n*n)` for `rfftn(norm="ortho")`). `n` must be a power of two and at
 /// most 64, matching the kernel's shared-memory bound.
 ///
-/// This is the reference for the GPU kernel: a plain radix-2 decimation-in-time
+/// The same transform as the GPU kernel, written as a plain radix-2 decimation-in-time
 /// transform on rows then columns, so the GPU's bit-reversal-plus-butterfly
 /// structure can be checked against it term by term. A difference here is a real
 /// bug, not floating-point reordering.

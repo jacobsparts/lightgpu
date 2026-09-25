@@ -7,7 +7,7 @@
 //! * [`vm`] - a loaded module, a launch helper and a device buffer, on top of
 //!   `ffi`. This is the layer an engine's `cuda.rs` would otherwise hand-roll.
 //! * [`ops`] - the kernel **name** table. The CUDA implementation lives in
-//!   `cuda/kernels.cu` (embedded as a fatbin) and the CPU twin in
+//!   `cuda/kernels.cu` (embedded as a fatbin) and the CPU backend in
 //!   `src/ops/cpu.rs`; both expose the same names and the same arithmetic.
 //! * [`safetensors`] - a reader for the standard `.safetensors` container:
 //!   `mmap` the file, parse the JSON header, hand out borrowed slices. This is

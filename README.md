@@ -10,7 +10,7 @@ cleaning up product photos that drives all of these engines.
 
 A dependency-light CUDA toolkit for building small inference engines without
 reimplementing the plumbing each time: the driver layer, the kernel set, and the
-CPU twins, in one place.
+CPU backend that keeps an engine running where there is no GPU, in one place.
 
 It exists because three engines in the family had grown their own copies of the same four
 things - the `dlopen` driver bindings, the nvcc/fatbin build, the launch and
@@ -62,7 +62,7 @@ them. Each consumer compiles only the subset it calls:
   `q8_0_gemm_aligned`, `q8_0_gemv`
 * **Fourier** - `fft2_r2c`, `fft2_c2r` (batched 2-D real transforms, n <= 64,
   unnormalised, half spectrum - the pair a spectral convolution calls; they are
-  what lets an engine drop cuFFT, and the matching CPU twins are the reference)
+  what lets an engine drop cuFFT)
 * **misc** - `noop`, `linear` (token layout)
 
 `cuda/CONVENTIONS.md` documents the signature and layout rules every kernel
@@ -105,8 +105,10 @@ cpu twins : ok
 `gpuinfo` is the smoke test for the whole combination: it loads the embedded
 fatbin, resolves **every** name in the op table against the module (so the table
 and the `.cu` cannot drift apart silently), launches a kernel on the device, and
-runs the CPU twins' self-test. A missing symbol or a failed launch fails the
-command.
+runs the CPU kernels' self-test. A missing symbol or a failed launch fails the
+command - nothing more: agreement between the two backends is a development-time
+check of the arithmetic, and neither replaces a golden fixture from the upstream
+reference implementation.
 
 ## Using it from an engine
 
