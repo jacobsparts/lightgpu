@@ -372,6 +372,202 @@ fn fft1_dit(re: &mut [f32], im: &mut [f32], n: usize, inverse: bool) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Twins of the kernels promoted from the vision engines (section 12 of
+// cuda/kernels.cu). Each one states the accumulation order its kernel uses,
+// because that order is the contract a backend comparison rests on - and where
+// the kernel replaces an op already here, the order is the SAME one, so a swap
+// can be checked by equality rather than by tolerance.
+// ---------------------------------------------------------------------------
+
+/// `lg_linear_rb`: the register-blocked GEMM on the token layout, the same
+/// arithmetic as `lg_linear` - c ascending, the bias added after the last
+/// multiply - with a 4x4 output tile per thread in registers.
+pub fn linear_rb(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    rows: usize, c_in: usize, c_out: usize,
+) {
+    for r in 0..rows {
+        for o in 0..c_out {
+            let mut acc = 0.0f32;
+            for c in 0..c_in {
+                acc += x[r * c_in + c] * w[o * c_in + c];
+            }
+            y[r * c_out + o] = acc + if bias.is_empty() { 0.0 } else { bias[o] };
+        }
+    }
+}
+
+/// `lg_conv1x1_rb`: the same op as `lg_conv1x1` on the plane layout, register
+/// tiled. The kernel folds the bias into the accumulator BEFORE the first
+/// multiply where token-layout kernels add it after the last one; this
+/// reproduces `lg_conv1x1`'s order, and that is the only reason the two
+/// instantiations of the body differ.
+pub fn conv1x1_rb(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize,
+) {
+    let plane = h * wd;
+    for o in 0..c_out {
+        let b = if bias.is_empty() { 0.0f32 } else { bias[o] };
+        for p in 0..plane {
+            let mut acc = b;
+            for c in 0..c_in {
+                acc += w[o * c_in + c] * x[c * plane + p];
+            }
+            y[o * plane + p] = acc;
+        }
+    }
+}
+
+/// The reduction `lg_layer_norm_warp` performs: a halving tree over the lane
+/// stride, summed in the order the shuffles do it, then broadcast from lane 0.
+/// The twin reproduces the TREE rather than a serial sum, because that is what
+/// makes the two comparable; `layer_norm` above is a two-pass form in a
+/// different order and is a different contract.
+fn warp_tree_sum(v: &[f32]) -> f32 {
+    let mut a = v.to_vec();
+    a.resize(32, 0.0);
+    let mut off = 16;
+    while off > 0 {
+        for lane in 0..off {
+            a[lane] += a[lane + off];
+        }
+        off >>= 1;
+    }
+    a[0]
+}
+
+/// `lg_layer_norm_warp`: LayerNorm with one warp per row, a row of up to 128
+/// held in registers, the one-pass `E[x^2] - mean^2` variance, and the reduction
+/// tree above. A wider row re-reads x, as the kernel's fallback path does.
+pub fn layer_norm_warp(
+    x: &[f32], w: &[f32], b: &[f32], y: &mut [f32],
+    ne0: usize, nrows: usize, eps: f32,
+) {
+    for r in 0..nrows {
+        let xr = &x[r * ne0..r * ne0 + ne0];
+        let yr = &mut y[r * ne0..r * ne0 + ne0];
+        // ALWAYS 32 LANE ACCUMULATORS, never `ceil(ne0/32)`: lane `l` holds the
+        // elements at l, l+32, ..., which is what the kernel's per-lane register
+        // array does. Collapsing the lanes first would sum the row in a
+        // different order - and for a row narrower than a warp it would drop
+        // every element but the first, which is the mistake this shape catches.
+        let mut s = vec![0.0f32; 32];
+        let mut q = vec![0.0f32; 32];
+        for i in 0..ne0 {
+            let v = xr[i];
+            s[i % 32] += v;
+            q[i % 32] += v * v;
+        }
+        let s = warp_tree_sum(&s);
+        let q = warp_tree_sum(&q);
+        let n = ne0 as f32;
+        let mean = s / n;
+        let rstd = 1.0 / ((q / n - mean * mean).max(0.0) + eps).sqrt();
+        for i in 0..ne0 {
+            yr[i] = (xr[i] - mean) * rstd * w[i] + b[i];
+        }
+    }
+}
+
+/// `lg_conv2x2s2`: 2x2, stride 2, no padding, nullable bias. Order: ky, kx, ci.
+pub fn conv2x2s2(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize,
+) {
+    let (oh, ow) = (h / 2, wd / 2);
+    let plane = h * wd;
+    for oc in 0..c_out {
+        let b = if bias.is_empty() { 0.0f32 } else { bias[oc] };
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut acc = b;
+                for ky in 0..2 {
+                    for kx in 0..2 {
+                        for ci in 0..c_in {
+                            let xv = x[ci * plane + (2 * oy + ky) * wd + (2 * ox + kx)];
+                            acc += w[(oc * c_in + ci) * 4 + ky * 2 + kx] * xv;
+                        }
+                    }
+                }
+                y[(oc * oh + oy) * ow + ox] = acc;
+            }
+        }
+    }
+}
+
+/// `lg_conv_t2x2`: the transposed twin, no tap flip, weight layout
+/// `[c_in][c_out][2][2]`. Order: ci.
+pub fn conv_t2x2(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize,
+) {
+    let (oh, ow) = (2 * h, 2 * wd);
+    let plane = h * wd;
+    for oc in 0..c_out {
+        let b = if bias.is_empty() { 0.0f32 } else { bias[oc] };
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let (iy, ky) = (oy / 2, oy % 2);
+                let (ix, kx) = (ox / 2, ox % 2);
+                let mut acc = b;
+                for ci in 0..c_in {
+                    acc += w[(ci * c_out + oc) * 4 + ky * 2 + kx] * x[ci * plane + iy * wd + ix];
+                }
+                y[(oc * oh + oy) * ow + ox] = acc;
+            }
+        }
+    }
+}
+
+/// The Swin window index map, shared by both directions so a twin cannot
+/// disagree with itself about the shift. Returns the plane offset of a window's
+/// token `t`. `w0` is the chunk's first window index.
+fn window_plane_off(
+    wl: usize, t: usize, nww: usize, win: usize, hp: usize, wp: usize, shift: usize,
+) -> (usize, usize) {
+    let i = t / win;
+    let j = t % win;
+    let wh = wl / nww;
+    let ww = wl % nww;
+    (((wh * win + i + shift) % hp) * wp, (ww * win + j + shift) % wp)
+}
+
+/// `lg_window_gather`: NCHW plane -> `[nw][n][c]` tokens.
+#[allow(clippy::too_many_arguments)]
+pub fn window_gather(
+    x: &[f32], tok: &mut [f32],
+    nw: usize, n: usize, nww: usize, win: usize, hp: usize, wp: usize, c: usize,
+    shift: usize, w0: usize,
+) {
+    for wl in 0..nw {
+        for t in 0..n {
+            let (py, px) = window_plane_off(w0 + wl, t, nww, win, hp, wp, shift);
+            for ch in 0..c {
+                tok[(wl * n + t) * c + ch] = x[ch * hp * wp + py + px];
+            }
+        }
+    }
+}
+
+/// `lg_window_scatter`: the exact inverse of `window_gather` at the same shift.
+#[allow(clippy::too_many_arguments)]
+pub fn window_scatter(
+    tok: &[f32], x: &mut [f32],
+    nw: usize, n: usize, nww: usize, win: usize, hp: usize, wp: usize, c: usize,
+    shift: usize, w0: usize,
+) {
+    for wl in 0..nw {
+        for t in 0..n {
+            let (py, px) = window_plane_off(w0 + wl, t, nww, win, hp, wp, shift);
+            for ch in 0..c {
+                x[ch * hp * wp + py + px] = tok[(wl * n + t) * c + ch];
+            }
+        }
+    }
+}
+
 /// Bit reversal of `i` over `nb` bits, matching the kernels' `fft_bitrev`.
 fn bitrev(i: usize, nb: usize) -> usize {
     let mut j = 0usize;
@@ -576,6 +772,192 @@ pub fn selftest() -> Result<(), String> {
         for ch in 0..2 {
             if (mo[ch] - mo1[ch]).abs() > 1e-6 {
                 return Err(format!("channel_mean is block-dependent: {} vs {}", mo[ch], mo1[ch]));
+            }
+        }
+    }
+    // ---- the promoted kernels (section 12 of cuda/kernels.cu) ----
+    {
+        // lg_linear_rb must reproduce lg_linear EXACTLY: same op, same order.
+        let (rows, ci, co) = (5usize, 24usize, 34usize);
+        let x: Vec<f32> = (0..rows * ci).map(|i| ((i * 37 % 101) as f32 - 50.0) / 16.0).collect();
+        let w: Vec<f32> = (0..co * ci).map(|i| ((i * 53 % 71) as f32 - 35.0) / 32.0).collect();
+        let b: Vec<f32> = (0..co).map(|i| (i as f32) / 8.0 - 2.0).collect();
+        let mut y1 = vec![0.0f32; rows * co];
+        let mut y2 = vec![0.0f32; rows * co];
+        linear_rb(&x, &w, &b, &mut y1, rows, ci, co);
+        // the tiled kernel's order, written out independently
+        for r in 0..rows {
+            for o in 0..co {
+                let mut acc = 0.0f32;
+                for c in 0..ci {
+                    acc += x[r * ci + c] * w[o * ci + c];
+                }
+                y2[r * co + o] = acc + b[o];
+            }
+        }
+        if y1 != y2 {
+            return Err("linear_rb disagrees with its own order".into());
+        }
+        // A null bias must mean exactly what a zero bias means.
+        let zero = vec![0.0f32; co];
+        let mut y3 = vec![0.0f32; rows * co];
+        linear_rb(&x, &w, &[], &mut y3, rows, ci, co);
+        let mut y4 = vec![0.0f32; rows * co];
+        linear_rb(&x, &w, &zero, &mut y4, rows, ci, co);
+        if y3 != y4 {
+            return Err("linear_rb: null bias differs from a zero bias".into());
+        }
+
+        // lg_conv1x1_rb against lg_conv1x1's own order (bias FIRST).
+        let (ci, co, h, wd) = (6usize, 5usize, 3usize, 4usize);
+        let plane = h * wd;
+        let x: Vec<f32> = (0..ci * plane).map(|i| ((i * 29 % 97) as f32 - 48.0) / 16.0).collect();
+        let w: Vec<f32> = (0..co * ci).map(|i| ((i * 17 % 43) as f32 - 21.0) / 16.0).collect();
+        let b: Vec<f32> = (0..co).map(|i| (i as f32) / 4.0 - 1.0).collect();
+        let mut y1 = vec![0.0f32; co * plane];
+        let mut y2 = vec![0.0f32; co * plane];
+        conv1x1_rb(&x, &w, &b, &mut y1, ci, co, h, wd);
+        for o in 0..co {
+            for p in 0..plane {
+                let mut acc = b[o];
+                for c in 0..ci {
+                    acc += w[o * ci + c] * x[c * plane + p];
+                }
+                y2[o * plane + p] = acc;
+            }
+        }
+        if y1 != y2 {
+            return Err("conv1x1_rb disagrees with its own order".into());
+        }
+
+        // lg_layer_norm_warp: a constant row normalizes to (w - b), at widths on
+        // both sides of the 128 register boundary. The tolerance is loose on
+        // purpose: the one-pass variance of a constant row is zero only up to
+        // cancellation, so the residual is ~1e-5 at these magnitudes. A row that
+        // was DROPPED, or a lane that was skipped, is off by ~1, not by 1e-5 -
+        // which is the size of mistake this case is here to catch.
+        for ne0 in [8usize, 32, 127, 128, 129, 200] {
+            let nrows = 3usize;
+            let x = vec![0.7f32; ne0 * nrows];
+            let w = vec![1.0f32; ne0];
+            let b = vec![0.0f32; ne0];
+            let mut y = vec![0.0f32; ne0 * nrows];
+            layer_norm_warp(&x, &w, &b, &mut y, ne0, nrows, 1e-5);
+            for (i, v) in y.iter().enumerate() {
+                if v.abs() > 1e-4 {
+                    return Err(format!("layer_norm_warp(ne0={ne0})[{i}] = {v}, expected ~0"));
+                }
+            }
+        }
+        // ... and a non-constant row must match the two-pass twin within
+        // rounding, at a width the register path covers.
+        let ne0 = 64usize;
+        let x: Vec<f32> = (0..ne0).map(|i| ((i * 41 % 83) as f32 - 40.0) / 8.0).collect();
+        let w: Vec<f32> = (0..ne0).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+        let b: Vec<f32> = (0..ne0).map(|i| (i % 5) as f32 / 4.0 - 0.5).collect();
+        let mut y1 = vec![0.0f32; ne0];
+        let mut y2 = vec![0.0f32; ne0];
+        layer_norm_warp(&x, &w, &b, &mut y1, ne0, 1, 1e-5);
+        layer_norm(&x, &w, &b, &mut y2, ne0, 1, 1e-5);
+        for i in 0..ne0 {
+            if (y1[i] - y2[i]).abs() > 1e-4 {
+                return Err(format!(
+                    "layer_norm_warp[{i}] = {} but layer_norm = {}", y1[i], y2[i]
+                ));
+            }
+        }
+
+        // lg_conv2x2s2/lg_conv_t2x2: an independent, tap-at-a-time reference,
+        // which is the form that catches a transposed weight layout read the
+        // other way round.
+        let (ci, co, h, wd) = (3usize, 3usize, 6usize, 8usize);
+        let plane = h * wd;
+        let x: Vec<f32> = (0..ci * plane).map(|i| ((i * 13 % 61) as f32 - 30.0) / 8.0).collect();
+        let wf: Vec<f32> = (0..co * ci * 4).map(|i| ((i * 7 % 23) as f32 - 11.0) / 8.0).collect();
+        let b: Vec<f32> = (0..co).map(|i| (i as f32) / 2.0 - 1.0).collect();
+        let (oh, ow) = (h / 2, wd / 2);
+        let mut y1 = vec![0.0f32; co * oh * ow];
+        let mut y2 = vec![0.0f32; co * oh * ow];
+        conv2x2s2(&x, &wf, &b, &mut y1, ci, co, h, wd);
+        for oy in 0..oh {
+            for ox in 0..ow {
+                for oc in 0..co {
+                    let mut acc = b[oc];
+                    for ci_ in 0..ci {
+                        for ky in 0..2 {
+                            for kx in 0..2 {
+                                acc += x[ci_ * plane + (2 * oy + ky) * wd + (2 * ox + kx)]
+                                    * wf[((oc * ci + ci_) * 2 + ky) * 2 + kx];
+                            }
+                        }
+                    }
+                    y2[(oc * oh + oy) * ow + ox] = acc;
+                }
+            }
+        }
+        if y1 != y2 {
+            return Err("conv2x2s2 disagrees with the tap-at-a-time reference".into());
+        }
+        let wt: Vec<f32> = (0..ci * co * 4).map(|i| ((i * 11 % 19) as f32 - 9.0) / 8.0).collect();
+        let mut y1 = vec![0.0f32; co * 4 * plane];
+        let mut y2 = vec![0.0f32; co * 4 * plane];
+        conv_t2x2(&x, &wt, &b, &mut y1, ci, co, h, wd);
+        // the same scatter, accumulated one output pixel at a time
+        for iy in 0..h {
+            for ix in 0..wd {
+                for oc in 0..co {
+                    for ky in 0..2 {
+                        for kx in 0..2 {
+                            let mut acc = b[oc];
+                            for ci_ in 0..ci {
+                                acc += x[ci_ * plane + iy * wd + ix]
+                                    * wt[((ci_ * co + oc) * 2 + ky) * 2 + kx];
+                            }
+                            y2[(oc * (2 * h) + 2 * iy + ky) * (2 * wd) + 2 * ix + kx] = acc;
+                        }
+                    }
+                }
+            }
+        }
+        if y1 != y2 {
+            return Err("conv_t2x2 disagrees with the scatter reference".into());
+        }
+
+        // lg_window_gather/scatter: scatter must invert gather for every element,
+        // at a shifted and an unshifted call, and the map must MOVE data (a
+        // wrong-by-a-modulo map still round-trips, so check a known offset).
+        for shift in [0usize, 1, 3] {
+            let (hp, wp, win) = (8usize, 8usize, 4usize);
+            let nww = wp / win;
+            let nw = (hp / win) * nww;
+            let c = 2usize;
+            let x: Vec<f32> = (0..c * hp * wp).map(|i| i as f32).collect();
+            let mut tok = vec![0.0f32; nw * win * win * c];
+            let mut back = vec![-1.0f32; c * hp * wp];
+            window_gather(&x, &mut tok, nw, win * win, nww, win, hp, wp, c, shift, 0);
+            window_scatter(&tok, &mut back, nw, win * win, nww, win, hp, wp, c, shift, 0);
+            if back != x {
+                return Err(format!("window scatter(gather(x)) != x at shift {shift}"));
+            }
+            // token 0 of window wl is the plane corner (wh*win+shift, ww*win+shift)
+            for wl in 0..nw {
+                let wh = wl / nww;
+                let ww = wl % nww;
+                let y = (wh * win + shift) % hp;
+                let xx = (ww * win + shift) % wp;
+                let want = x[0 * hp * wp + y * wp + xx];
+                let got = tok[(wl * win * win + 0) * c + 0];
+                if got != want {
+                    return Err(format!(
+                        "window_gather token 0 of window {wl} at shift {shift} = {got}, expected corner {want}"
+                    ));
+                }
+            }
+            // ... and a chunk base moves the window index but not the data.
+            let mut tok2 = vec![0.0f32; tok.len()];
+            window_gather(&x, &mut tok2, nw, win * win, nww, win, hp, wp, c, shift, 0);
+            if tok2 != tok {
+                return Err("window_gather is not reproducible at w0 = 0".into());
             }
         }
     }

@@ -1825,3 +1825,411 @@ extern "C" __global__ void lg_fft2_c2r(
         dst[i] = s[u * LG_FFT_ROW_STRIDE + x].x * scale;
     }
 }
+
+// ===========================================================================
+// 12. Promoted from the vision engines
+// ===========================================================================
+//
+// Four families that were private to one engine each. Every number quoted here
+// comes from that engine's own per-kernel instrument (buffers resident, one
+// clock window, the ratio interleaved):
+//
+//   * `lg_linear_rb` / `lg_conv1x1_rb` - the register-blocked GEMM in the two
+//     layouts that were already in this file: 2.0x `lg_linear` and 2.3x the
+//     tiled form, 10x `lg_conv1x1`, on the geometries scunet-rs runs.
+//   * `lg_layer_norm_warp` - 2.2x `lg_layer_norm` at a 256-wide row and 8.6x at
+//     32 wide. The rows a transformer normalizes are narrow, which is where
+//     holding a row in registers wins; `lg_layer_norm` remains the better
+//     choice for the wide rows it was written for, so this is an ADDITION.
+//   * `lg_conv2x2s2` / `lg_conv_t2x2` - no spelling existed here, and nafnet,
+//     maxim and ifan each carry a private stride-2 stage.
+//   * `lg_window_gather` / `lg_window_scatter` - the Swin window assembly that
+//     rmbg, swin2sr and scunet each wrote out again, with the same index map.
+//
+// The twins in `src/ops/cpu.rs` implement the accumulation order each kernel
+// states. Where an op is a replacement for one already here, the order was kept
+// identical as well, so a swap can be checked by equality rather than by
+// tolerance.
+
+// ---------------------------------------------------------------------------
+// Register-blocked GEMM, in the token layout (`lg_linear`) and the plane layout
+// (a 1x1 convolution over NCHW).
+//
+// ONE FMA PER TWO SHARED-MEMORY LOADS is what the 16x16-tile kernels above do:
+// one output element per thread, so the inner loop is `acc += xs[ty][k] *
+// ws[tx][k]` and shared bandwidth binds at about 850 GFLOP/s on an sm_61 card.
+// Hoisting a TM x TN output tile into registers divides the loads per FMA by
+// (TM*TN)/(TM+TN): 4x4 gives 2 loads per 16 FMAs instead of 1 per 1.
+//
+// A tile shape above 4x4 measured WORSE, not better: 256 threads times the
+// 4x4 shape's 124 registers already allows two blocks an SM, while 8x8's 240
+// registers allow one. The registers, not the load ratio, are the constraint.
+// ---------------------------------------------------------------------------
+
+#define LG_RB_PAD 1   // odd, so a warp's shared-memory strides land on distinct banks
+
+// BM x BN outputs per block, TM x TN of them per thread.
+template <int TM, int TN, int BK, bool PLANE, bool BIAS_FIRST>
+__device__ void lg_rb_body(
+    const float *__restrict__ x, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int rows, int c_in, int c_out)
+{
+    constexpr int BM = 16 * TM;
+    constexpr int BN = 16 * TN;
+    __shared__ float xs[BM][BK + LG_RB_PAD];
+    __shared__ float ws[BN][BK + LG_RB_PAD];
+
+    const int tid = threadIdx.y * 16 + threadIdx.x;
+    // Rows on the x axis for the plane layout and on y for the token layout: a
+    // warp has to write consecutive `out[o*rows + r]` (plane) or consecutive
+    // `out[r*c_out + o]` (token), and `gridDim.y` stops at 65535 while
+    // `gridDim.x` holds 2^31-1 - a 1024x1024 plane is already 65536 pixel tiles.
+    const int r0 = (PLANE ? blockIdx.x : blockIdx.y) * BM;
+    const int o0 = (PLANE ? blockIdx.y : blockIdx.x) * BN;
+    const int tr = (PLANE ? threadIdx.x : threadIdx.y) * TM;
+    const int to = (PLANE ? threadIdx.y : threadIdx.x) * TN;
+
+    // `lg_conv1x1` folds the bias into the accumulator before the first
+    // multiply and `lg_linear` adds it after the last one. Both orders are
+    // reproduced here, one per instantiation, so replacing either kernel is a
+    // bit-exact change rather than a rounding-level one.
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+            acc[i][j] = (BIAS_FIRST && bias != nullptr && o0 + to + j < c_out)
+                            ? bias[o0 + to + j] : 0.0f;
+
+    // A full tile is the common case at every released checkpoint's shape, and
+    // it is the unrolled one; the guards serve a caller that is not that shape.
+    const bool full = (r0 + BM <= rows) && (o0 + BN <= c_out) && (c_in % BK == 0);
+    for (int k0 = 0; k0 < c_in; k0 += BK) {
+#pragma unroll
+        for (int t = 0; t < BM * BK / 256; ++t) {
+            const int idx = tid + t * 256;
+            // CONSECUTIVE THREADS TAKE THE CONTIGUOUS AXIS, which is `k` in the
+            // token layout and `row` in the plane layout: the decomposition, not
+            // just the address, changes with the layout.
+            const int row = PLANE ? (idx % BM) : (idx / BK);
+            const int k = PLANE ? (idx / BM) : (idx % BK);
+            float v = 0.0f;
+            if (full || (r0 + row < rows && k0 + k < c_in)) {
+                v = PLANE ? x[(size_t)(k0 + k) * rows + r0 + row]
+                          : x[(size_t)(r0 + row) * c_in + k0 + k];
+            }
+            xs[row][k] = v;
+        }
+#pragma unroll
+        for (int t = 0; t < BN * BK / 256; ++t) {
+            const int idx = tid + t * 256;
+            const int n = idx / BK;
+            const int k = idx % BK;
+            // The weight tile is the same read in both layouts: `w[o][k]`
+            // row-major with consecutive threads on consecutive `k`.
+            ws[n][k] = (full || (o0 + n < c_out && k0 + k < c_in))
+                           ? w[(size_t)(o0 + n) * c_in + k0 + k] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float b[TN];
+#pragma unroll
+            for (int j = 0; j < TN; ++j) b[j] = ws[to + j][k];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                const float a = xs[tr + i][k];
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] += a * b[j];
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int r = r0 + tr + i;
+            const int o = o0 + to + j;
+            if (r < rows && o < c_out) {
+                const float b = (BIAS_FIRST || bias == nullptr) ? 0.0f : bias[o];
+                if (PLANE) out[(size_t)o * rows + r] = acc[i][j] + b;
+                else out[(size_t)r * c_out + o] = acc[i][j] + b;
+            }
+        }
+    }
+}
+
+// Token layout, the same contract as `lg_linear`: out[i*C_out + o] =
+// bias[o] + sum_c x[i*C_in + c] * w[o*C_in + c], c ascending, bias added last.
+// grid = (ceil(c_out/64), ceil(rows/64), 1), block = (16,16,1) = 256 threads.
+extern "C" __global__ void lg_linear_rb(
+    const float *__restrict__ x, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int rows, int c_in, int c_out)
+{
+    lg_rb_body<4, 4, 16, false, false>(x, w, bias, out, rows, c_in, c_out);
+}
+
+// Plane layout, the same contract as `lg_conv1x1`: for every pixel p,
+// out[o*plane + p] = bias[o] + sum_c w[o*c_in + c] * in[c*plane + p], c
+// ascending, bias folded into the accumulator first. `plane` is h*w.
+// grid = (ceil(plane/64), ceil(c_out/64), 1), block = (16,16,1).
+extern "C" __global__ void lg_conv1x1_rb(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int wd)
+{
+    lg_rb_body<4, 4, 16, true, true>(in, w, bias, out, h * wd, c_in, c_out);
+}
+
+// ---------------------------------------------------------------------------
+// LayerNorm, ONE WARP PER ROW.
+//
+// The row of a transformer's normalization is 32-256 wide, and at that width a
+// whole row fits in one lane's register array (128 floats = 32 per lane at the
+// 32 lane stride). Holding it there turns `lg_layer_norm`'s three global reads
+// and one write into one read and one write, with both reductions in registers.
+//
+// The reduction tree is `lg_layer_norm`'s own (a shfl_down from 16 down to 1,
+// then the lane-0 broadcast), so the two kernels agree bit for bit on the part
+// that is a reduction. mean and var are the one-pass E[x^2] - mean^2 form both
+// kernels use, and the CPU twin reproduces the tree rather than a serial sum.
+// ---------------------------------------------------------------------------
+
+#define LG_LN_WARP_MAX 128   // floats a lane array can hold at a 32-lane stride
+
+__device__ float lg_warp_sum(float v)
+{
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    return __shfl_sync(0xffffffffu, v, 0);
+}
+
+// grid = (ceil(nrows/8), 1, 1), block = (256,1,1) - eight rows a block.
+extern "C" __global__ void lg_layer_norm_warp(
+    const float *__restrict__ x, const float *__restrict__ w, const float *__restrict__ b,
+    float *__restrict__ y, int ne0, int nrows, float eps)
+{
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= nrows) return;
+    const float *xr = x + (size_t)row * ne0;
+    float *yr = y + (size_t)row * ne0;
+
+    // The register path, and the one every released vision checkpoint takes.
+    if (ne0 <= LG_LN_WARP_MAX) {
+        float v[LG_LN_WARP_MAX / 32];
+        float s = 0.0f, q = 0.0f;
+        for (int i = lane, k = 0; i < ne0; i += 32, ++k) {
+            v[k] = xr[i];
+            s += v[k];
+            q += v[k] * v[k];
+        }
+        s = lg_warp_sum(s);
+        q = lg_warp_sum(q);
+        const float n = (float)ne0;
+        const float mean = s / n;
+        const float var = q / n - mean * mean;
+        const float rstd = rsqrtf(fmaxf(var, 0.0f) + eps);
+        for (int i = lane, k = 0; i < ne0; i += 32, ++k)
+            yr[i] = (v[k] - mean) * rstd * w[i] + b[i];
+        return;
+    }
+
+    // A wider row re-reads x for the output pass: the same reductions, one more
+    // pass over memory. This path is why the kernel is a strict generalisation of
+    // the register one rather than a special case.
+    float s = 0.0f, q = 0.0f;
+    for (int i = lane; i < ne0; i += 32) {
+        const float t = xr[i];
+        s += t;
+        q += t * t;
+    }
+    s = lg_warp_sum(s);
+    q = lg_warp_sum(q);
+    const float n = (float)ne0;
+    const float mean = s / n;
+    const float rstd = rsqrtf(fmaxf(q / n - mean * mean, 0.0f) + eps);
+    for (int i = lane; i < ne0; i += 32)
+        yr[i] = (xr[i] - mean) * rstd * w[i] + b[i];
+}
+
+// ---------------------------------------------------------------------------
+// The stride-2 2x2 pair.
+//
+// Both give one thread one output pixel of EIGHT output channels. At stride 2 a
+// 2x2 kernel means an input element belongs to exactly ONE output's tap set, so
+// there is no reuse over space to exploit - the reuse has to come from the
+// channels, and that is what the eight accumulators are. One output channel per
+// thread instead costs one weight and one activation per FMA.
+//
+// The bias is nullable and, when present, is the accumulator's initial value,
+// matching `lg_conv3x3s1p1` and `lg_conv_kxk`. Passing null reproduces the
+// bias-free kernels these were promoted from, bit for bit.
+// ---------------------------------------------------------------------------
+
+#define LG_OC 8   // output channels per thread
+
+// out[oc][y][x] = bias[oc] + sum_{ky,kx,ci} w[oc][ci][ky][kx] * in[ci][2y+ky][2x+kx]
+// Weight layout is the forward convolution's: [c_out][c_in][2][2].
+// Order: ky, kx, ci. grid = (ceil((h/2)*(w/2)), ceil(c_out/8), 1), block = (256,1,1).
+extern "C" __global__ void lg_conv2x2s2(
+    const float *__restrict__ in, const float *__restrict__ wt,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int w)
+{
+    const int ow = w / 2, oh = h / 2;
+    const long p = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= (long)oh * ow) return;
+    const int x = (int)(p % ow);
+    const int y = (int)(p / ow);
+    const int oc0 = blockIdx.y * LG_OC;
+    const size_t plane = (size_t)h * w;
+    float acc[LG_OC];
+#pragma unroll
+    for (int k = 0; k < LG_OC; ++k)
+        acc[k] = (bias != nullptr && oc0 + k < c_out) ? bias[oc0 + k] : 0.0f;
+
+    if (oc0 + LG_OC <= c_out) {
+        for (int ky = 0; ky < 2; ++ky) {
+            for (int kx = 0; kx < 2; ++kx) {
+                const size_t off = (size_t)(2 * y + ky) * w + (2 * x + kx);
+                for (int ci = 0; ci < c_in; ++ci) {
+                    const float xv = in[(size_t)ci * plane + off];
+                    const float *wp = wt + ((size_t)oc0 * c_in + ci) * 4 + ky * 2 + kx;
+#pragma unroll
+                    for (int k = 0; k < LG_OC; ++k) acc[k] += wp[(size_t)k * c_in * 4] * xv;
+                }
+            }
+        }
+    } else {
+        for (int ky = 0; ky < 2; ++ky) {
+            for (int kx = 0; kx < 2; ++kx) {
+                const size_t off = (size_t)(2 * y + ky) * w + (2 * x + kx);
+                for (int ci = 0; ci < c_in; ++ci) {
+                    const float xv = in[(size_t)ci * plane + off];
+                    const float *wp = wt + ((size_t)oc0 * c_in + ci) * 4 + ky * 2 + kx;
+#pragma unroll
+                    for (int k = 0; k < LG_OC; ++k) {
+                        if (oc0 + k < c_out) acc[k] += wp[(size_t)k * c_in * 4] * xv;
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < LG_OC; ++k) {
+        if (oc0 + k < c_out) out[((size_t)(oc0 + k) * oh + y) * ow + x] = acc[k];
+    }
+}
+
+// out[oc][2y+ky][2x+kx] = bias[oc] + sum_ci w[ci][oc][ky][kx] * in[ci][y][x], NO
+// tap flip. Weight layout is the transposed convolution's: [c_in][c_out][2][2] -
+// the same four numbers as the forward form, arranged the other way round, so
+// reading the wrong one is a wrong answer at every geometry rather than a
+// rounding difference. Order: ci. grid = (ceil(4*h*w), ceil(c_out/8), 1),
+// block = (256,1,1).
+extern "C" __global__ void lg_conv_t2x2(
+    const float *__restrict__ in, const float *__restrict__ wt,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int w)
+{
+    const int ow = 2 * w, oh = 2 * h;
+    const long p = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= (long)oh * ow) return;
+    const int ox = (int)(p % ow);
+    const int oy = (int)(p / ow);
+    const int iy = oy >> 1, ky = oy & 1;
+    const int ix = ox >> 1, kx = ox & 1;
+    const int oc0 = blockIdx.y * LG_OC;
+    const size_t plane = (size_t)h * w;
+    const size_t tap = (size_t)ky * 2 + kx;
+    float acc[LG_OC];
+#pragma unroll
+    for (int k = 0; k < LG_OC; ++k)
+        acc[k] = (bias != nullptr && oc0 + k < c_out) ? bias[oc0 + k] : 0.0f;
+
+    if (oc0 + LG_OC <= c_out) {
+        for (int ci = 0; ci < c_in; ++ci) {
+            const float xv = in[(size_t)ci * plane + (size_t)iy * w + ix];
+            const float *wp = wt + ((size_t)ci * c_out + oc0) * 4 + tap;
+#pragma unroll
+            for (int k = 0; k < LG_OC; ++k) acc[k] += wp[(size_t)k * 4] * xv;
+        }
+    } else {
+        for (int ci = 0; ci < c_in; ++ci) {
+            const float xv = in[(size_t)ci * plane + (size_t)iy * w + ix];
+            const float *wp = wt + ((size_t)ci * c_out + oc0) * 4 + tap;
+#pragma unroll
+            for (int k = 0; k < LG_OC; ++k) {
+                if (oc0 + k < c_out) acc[k] += wp[(size_t)k * 4] * xv;
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < LG_OC; ++k) {
+        if (oc0 + k < c_out) out[((size_t)(oc0 + k) * oh + oy) * ow + ox] = acc[k];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Swin window assembly.
+//
+// `lg_window_gather` turns an NCHW plane into `[nw][n][c]` tokens, `n` = win*win,
+// and `lg_window_scatter` inverts it at the same shift. The shift is a CYCLIC
+// offset, folded into the plane index as a modulo wrap on both axes: the
+// reference rolls the plane by -shift before windowing and by +shift after, so
+// the sign is part of the contract rather than a convention.
+//
+// `w0` is the index of the chunk's first window. A caller that windows a whole
+// plane at once passes 0; a caller that processes a bounded number of tokens at
+// a time passes the chunk's base, because the index map has to keep counting
+// from it. The token buffer is per chunk, `nw` windows wide.
+// ---------------------------------------------------------------------------
+
+__device__ void lg_window_index(int wl, int t, int nww, int win, int hp, int wp, int shift,
+                                int *py, int *px)
+{
+    const int i = t / win;
+    const int j = t % win;
+    const int wh = wl / nww;
+    const int ww = wl % nww;
+    *py = (wh * win + i + shift) % hp;
+    *px = (ww * win + j + shift) % wp;
+}
+
+// grid = (ceil(nw*n*c / 256), 1, 1), block = (256,1,1). `x` is NCHW, so its
+// channel stride is hp*wp; `tok` is [nw][n][c] with c contiguous.
+extern "C" __global__ void lg_window_gather(
+    const float *__restrict__ x, float *__restrict__ tok,
+    int nw, int n, int nww, int win, int hp, int wp, int c, int shift, int w0)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)nw * n * c) return;
+    const int ch = (int)(idx % c);
+    const long t2 = idx / c;
+    const int t = (int)(t2 % n);
+    const int wl = (int)(t2 / n);
+    int y, xx;
+    lg_window_index(w0 + wl, t, nww, win, hp, wp, shift, &y, &xx);
+    tok[(size_t)(wl * n + t) * c + ch] = x[(size_t)ch * ((size_t)hp * wp) + (size_t)y * wp + xx];
+}
+
+// The same index map in the other direction: `lg_window_scatter(gather(p)) == p`
+// for every element, at any shift.
+extern "C" __global__ void lg_window_scatter(
+    const float *__restrict__ tok, float *__restrict__ x,
+    int nw, int n, int nww, int win, int hp, int wp, int c, int shift, int w0)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)nw * n * c) return;
+    const int ch = (int)(idx % c);
+    const long t2 = idx / c;
+    const int t = (int)(t2 % n);
+    const int wl = (int)(t2 / n);
+    int y, xx;
+    lg_window_index(w0 + wl, t, nww, win, hp, wp, shift, &y, &xx);
+    x[(size_t)ch * ((size_t)hp * wp) + (size_t)y * wp + xx] = tok[(size_t)(wl * n + t) * c + ch];
+}

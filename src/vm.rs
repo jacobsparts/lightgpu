@@ -32,16 +32,35 @@ pub struct Device {
     pub smem_per_block: i32,
 }
 
-static CONTEXT: OnceLock<Result<(), String>> = OnceLock::new();
+/// The process's primary context handle, wrapped so it can live in a `static`.
+///
+/// A `CUcontext` is a driver-owned handle, not memory this crate owns; it is
+/// only ever passed back to the driver, and the driver is itself thread-safe
+/// about it. That is what the unsafe impls assert.
+#[derive(Clone, Copy)]
+struct Ctx(ffi::CUcontext);
+unsafe impl Send for Ctx {}
+unsafe impl Sync for Ctx {}
 
-/// Bind device 0's primary context to this process, idempotently.
+static CONTEXT: OnceLock<Result<Ctx, String>> = OnceLock::new();
+
+/// Bind device 0's primary context to the CALLING THREAD, idempotently.
 ///
 /// Every entry point calls this first (via [`init`]), so a caller can use
 /// [`Module`], [`DevBuf`] or [`sync`] without having called [`device`] - the
 /// alternative is a "you must initialise first" contract that fails with
 /// `CUDA_ERROR_INVALID_CONTEXT` at the first allocation.
+///
+/// CREATION IS ONCE, BINDING IS EVERY CALL. A CUDA context is current on one
+/// THREAD at a time, and this function used to do the `cuCtxSetCurrent` inside
+/// the `OnceLock` closure - so only the first thread to arrive ever had the
+/// context bound, and every other thread (a test harness's threads, a worker
+/// pool, any second caller) failed with `CUDA_ERROR_INVALID_CONTEXT` on its
+/// first allocation or module load. The context handle is what is cached; the
+/// bind is repeated, which is cheap and is what makes the crate usable from
+/// more than one thread.
 fn bind_context() -> Result<(), String> {
-    CONTEXT
+    let ctx = CONTEXT
         .get_or_init(|| {
             let d = ffi::driver()?;
             ffi::chk(d.cuInit(0), "cuInit")?;
@@ -49,19 +68,23 @@ fn bind_context() -> Result<(), String> {
             ffi::chk(d.cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
             let mut ctx: ffi::CUcontext = std::ptr::null_mut();
             ffi::chk(d.cuDevicePrimaryCtxRetain(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
-            ffi::chk(d.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")?;
             // Ask the driver to BLOCK (yield the CPU) on synchronisation rather
             // than spin. The default busy-waits in user space for the whole
             // duration of every GPU operation, which pegs a core for an entire
             // inference run. Non-fatal: an already-initialised primary context
             // may reject the change and correctness does not depend on it.
             const CU_CTX_SCHED_BLOCKING_SYNC: u32 = 0x04;
-            if let Err(e) = ffi::chk(d.cuCtxSetFlags(CU_CTX_SCHED_BLOCKING_SYNC), "cuCtxSetFlags") {
+            let d2 = ffi::driver()?;
+            ffi::chk(d2.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")?;
+            if let Err(e) = ffi::chk(d2.cuCtxSetFlags(CU_CTX_SCHED_BLOCKING_SYNC), "cuCtxSetFlags")
+            {
                 eprintln!("lightgpu: {e} (spin-wait stays)");
             }
-            Ok(())
+            Ok(Ctx(ctx))
         })
-        .clone()
+        .clone()?;
+    let d = ffi::driver()?;
+    ffi::chk(d.cuCtxSetCurrent(ctx.0), "cuCtxSetCurrent")
 }
 
 /// Initialise the driver and bind the primary context. Idempotent: the first

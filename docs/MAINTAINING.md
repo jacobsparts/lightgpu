@@ -41,6 +41,43 @@ value. The test is whether the OPERATION is generic, not whether there are two
 call sites today - and the cost of waiting is a second copy that has to be
 reconciled later, which is the thing this document exists to prevent.
 
+### Writing one here first
+
+Most of the kernels in section 12 of `cuda/kernels.cu` were written inside one
+engine, proved there against that engine's own tests and fixture, and moved here
+once they were 2-10x an op the toolkit already had. That is the intended order,
+because a measurement is what decides a kernel and an engine is where the
+geometries to measure against are. The move has three parts, all of them
+mechanical:
+
+1. copy the kernel into `cuda/kernels.cu`, dropping its `sc_`/`mx_`/`nf_` prefix
+   for `lg_`, and write the accumulation order and the bias order on it. If it
+   replaces an existing op, KEEP THAT ORDER EXACTLY - the toolkit's own
+   `lg_conv1x1` folds the bias into the accumulator before the first multiply and
+   `lg_linear` adds it after the last, and `lg_conv1x1_rb`/`lg_linear_rb`
+   reproduce each, which is what lets a caller swap one for the other and compare
+   by EQUALITY rather than by tolerance;
+2. add it to `OPS` and `NAMES` in `src/ops/mod.rs`, a CPU twin in
+   `src/ops/cpu.rs` and a case in `ops::cpu::selftest`. The twin is written from
+   the kernel's stated contract rather than from the kernel's code, so the two
+   can disagree; where the kernel is a replacement, demand equality, not a
+   tolerance. `cargo run --release --bin gpuinfo` resolves every name in
+   `NAMES` and runs the self-test, and it is the check that the move is complete;
+3. leave the engine's original in place behind its environment switch until the
+   A/B has been re-run from the toolkit's copy. The old kernel is the
+   measurement's other arm and, in the case of a form the CPU backend was first
+   matched to, the only counterexample that can still be re-run.
+
+Two practical notes from doing this. Do NOT replace an existing op in place when
+the new one needs a different BLOCK SHAPE: a register-blocked GEMM needs
+`block = (16,16,1)` with the grid derived from its tile, while every caller of
+`lg_linear` has `(16,16,1)` hard-coded with a grid of its own, so the promoted
+kernel needs its own name. And a promoted kernel reaches the `path`-dependent
+engines (`scunet-rs`, `swin2sr-rs`) as soon as it compiles, but the `git`-dependent
+ones only after this repository is committed, pushed and their lockfiles
+refreshed - so a consumer's build failing at its `known_kernel` assertion is the
+normal first symptom, not a mistake in the consumer.
+
 Consumer-specific kernels can be compiled alongside toolkit kernels with
 `lightgpu_build::fatbin_modules`, using one fatbin/module per source file. This
 preserves entry pruning and separate namespaces. See the build helper API and

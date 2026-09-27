@@ -69,6 +69,13 @@ pub const OPS: &[Op] = &[
     Op { name: "lg_pixel_unshuffle2", doc: "Space-to-depth: [C][H][W] -> [4C][H/2][W/2] with output channel c*4 + dy*2 + dx from input channel c at (2y+dy, 2x+dx) - PyTorch's pixel_unshuffle(x, 2). The PERMUTATION is the contract, not just the shape: a following conv's weights are ordered by it. grid = (ceil((w/2)/32), ceil((h/2)/8)). NOT lg_merge_2x2, which merges the same taps into a token-major layout." },
     Op { name: "lg_fft2_r2c", doc: "Batched 2-D real-to-complex FFT. in is [batch][n][n] row-major, out is [batch][n][n/2+1] INTERLEAVED complex - the half spectrum rfftn defines. n <= 64 (the plane lives in shared memory), nb = log2(n) selects the bit-reversal width. UNNORMALISED, like cuFFT: pass scale = 1.0f and apply 1/sqrt(n*n) yourself, or fold the ortho factor in by passing it as scale. grid = (batch, 1, 1), block = (256, 1, 1), no dynamic shared memory." },
     Op { name: "lg_fft2_c2r", doc: "Batched 2-D complex-to-real inverse FFT: in is the [batch][n][n/2+1] interleaved half spectrum lg_fft2_r2c produces, out is [batch][n][n] real. The full spectrum is rebuilt by conjugate symmetry internally, so the caller stores only the half spectrum. UNNORMALISED: pass scale = 1/sqrt(n*n) for the ortho inverse (and undo any scale the forward folded in). grid = (batch, 1, 1), block = (256, 1, 1)." },
+    Op { name: "lg_linear_rb", doc: "The SAME op as `lg_linear` (token layout, out[i*C_out + o] = bias[o] + sum_c x[i*C_in + c] * w[o*C_in + c], c ascending, bias added last), with a 4x4 register tile per thread instead of one output element. 2.0x `lg_linear` on the vision shapes that promoted it, and bit-identical to it on the same input. grid = (ceil(c_out/64), ceil(rows/64), 1), block = (16,16,1) = 256 threads, no dynamic shared memory." },
+    Op { name: "lg_conv1x1_rb", doc: "The SAME op as `lg_conv1x1` (NCHW 1x1: out[o*plane + p] = bias[o] + sum_c w[o*c_in + c] * in[c*plane + p], plane = h*w, c ascending, bias folded into the accumulator first), register-tiled 4x4. That bias order is what `lg_conv1x1` does, and both are reproduced exactly, so swapping is bit-exact. grid = (ceil(plane/64), ceil(c_out/64), 1), block = (16,16,1)." },
+    Op { name: "lg_layer_norm_warp", doc: "LayerNorm as `lg_layer_norm`, one WARP per row, for NARROW rows: a row of up to 128 is held in one lane's registers, so x is read once and written once instead of three times. Same reduction tree, same one-pass variance. grid = (ceil(nrows/8), 1, 1), block = (256,1,1). Use `lg_layer_norm` for wide rows." },
+    Op { name: "lg_conv2x2s2", doc: "2x2 convolution, stride 2, no padding, nullable bias: out[oc][y][x] = bias[oc] + sum_{ky,kx,ci} w[oc][ci][ky][kx] * in[ci][2y+ky][2x+kx]. Order: ky, kx, ci. Eight output channels per thread, which is where the reuse is - at stride 2 with a 2x2 kernel, an input element feeds exactly one output's tap set. grid = (ceil((h/2)*(w/2)), ceil(c_out/8), 1), block = (256,1,1)." },
+    Op { name: "lg_conv_t2x2", doc: "The transposed twin of `lg_conv2x2s2`: out[oc][2y+ky][2x+kx] = bias[oc] + sum_ci w[ci][oc][ky][kx] * in[ci][y][x], NO tap flip, weight layout [c_in][c_out][2][2] (torch's ConvTranspose2d) - not the forward form's [c_out][c_in][2][2]. Order: ci. grid = (ceil(4*h*w), ceil(c_out/8), 1), block = (256,1,1)." },
+    Op { name: "lg_window_gather", doc: "Swin window assembly, NCHW plane -> [nw][n][c] tokens with n = win*win. The shift is a CYCLIC offset applied as a modulo wrap on both axes (the reference rolls the plane by -shift before windowing). `w0` is the chunk's first window index, 0 for a whole plane, so a caller that bounds its token count passes the base. grid = (ceil(nw*n*c/256), 1, 1), block = (256,1,1)." },
+    Op { name: "lg_window_scatter", doc: "The inverse of `lg_window_gather` at the same shift: `scatter(gather(p)) == p` for every element. Same arguments, same grid." },
 ];
 
 /// Kernel names, for a completeness check against a loaded module.
@@ -121,6 +128,13 @@ pub static NAMES: &[&str] = &[
     "lg_pixel_unshuffle2",
     "lg_fft2_r2c",
     "lg_fft2_c2r",
+    "lg_linear_rb",
+    "lg_conv1x1_rb",
+    "lg_layer_norm_warp",
+    "lg_conv2x2s2",
+    "lg_conv_t2x2",
+    "lg_window_gather",
+    "lg_window_scatter",
 ];
 
 /// Is this name part of the shipped set?
