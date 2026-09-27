@@ -23,6 +23,11 @@ cuda = []
 
 [dependencies]
 libc = "0.2"
+# The parallel twins (`conv1x1`, `conv3x3s1p1` and the row-tiled framing they
+# share). Every consumer engine except the two CPU-only ones already depends on
+# rayon and uses it for the same reason, so this adds no crate to a family build
+# that did not already have one - see docs/MAINTAINING.md.
+rayon = "1"
 
 [build-dependencies]
 lightgpu-build = { path = "build-support" }

@@ -7,6 +7,18 @@
 //! difference rather than a rounding one; it is not a reason to leave the CPU
 //! side slow. The few places where the two deliberately differ (erf, layer-norm
 //! variance) are documented at the kernel instead.
+//!
+//! THE CONVOLUTIONS ARE THE EXCEPTION TO "PLAIN RUST", deliberately. The
+//! elementwise twins are reference implementations - obviously right, and fast
+//! enough for an op that touches each element once - but a convolution is
+//! the hot spot of every vision engine here (in ifan-rs at 256x256 the 3x3s are
+//! 72.7% of a CPU pass), and rather than ship a slow twin, three engines each
+//! wrote their own AVX2 + rayon copy of that one op. `conv1x1` and
+//! `conv3x3s1p1` are therefore parallel and vectorised; what is NOT given up is
+//! the arithmetic, which is still the kernel's own order - see the section
+//! comment above them.
+
+use rayon::prelude::*;
 
 /// `lg_add`: y = a + b
 pub fn add(a: &[f32], b: &[f32], y: &mut [f32]) {
@@ -229,8 +241,6 @@ pub fn rms_norm(x: &[f32], w: &[f32], y: &mut [f32], ne0: usize, nrows: usize, e
     }
 }
 
-/// The toolkit's own smoke test: every twin must run and agree with a
-/// straightforward reimplementation on a fixed input. Called by `gpuinfo`.
 /// `lg_fft2_r2c`: batched 2-D real FFT, unnormalised, half spectrum.
 ///
 /// Same shape and convention as the GPU kernel: `x` is `[batch][n][n]` row-major,
@@ -369,6 +379,531 @@ fn fft1_dit(re: &mut [f32], im: &mut [f32], n: usize, inverse: bool) {
             }
         }
         len <<= 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Twins of the CONVOLUTIONS in section 6 of cuda/kernels.cu - `lg_conv1x1` and
+// `lg_conv3x3s1p1` - which are the two operators the tiled kernels below are
+// alternative implementations of, so the four live side by side.
+//
+// THIS PAIR IS THE FIRST HERE THAT IS PARALLEL AND VECTORISED, and that is not
+// drift: it is the reason the pair exists. Everything above is a reference
+// implementation - obviously right, and fast enough for an op that touches each
+// element once. A convolution is in a different class (in ifan-rs at 256x256 the
+// 3x3s are 72.7% of a whole CPU pass), and rather than ship a slow twin three
+// engines each wrote their OWN AVX2 + rayon copy of this one op. One twin,
+// measured, replaces all three:
+//
+//   * RAYON, one task per (output channel, output row). A task per CHANNEL is
+//     not enough: `ending` in nafnet's graph is a 32 -> 3 conv, so a
+//     channel-grained split gives it three tasks on a 24-thread machine, which
+//     is a barrier against an idle machine. A row is also the natural unit - the
+//     output is written exactly once - and the channel still belongs to the
+//     task, so a row's weight slice and bias are loop invariants.
+//   * A CONTIGUOUS INNER LOOP. For a fixed tap the output row and the input row
+//     are both contiguous, so the inner loop is `acc[i] += k * src[i]`, an AXPY,
+//     and each tap's bounds are resolved ONCE from the tap's own offset instead
+//     of per output element inside the innermost loop of a 9-tap convolution.
+//     That branch is what stops the pixel-at-a-time form vectorising.
+//   * AVX2 + FMA BEHIND A RUNTIME TEST (`is_x86_feature_detected!`), never a
+//     build-time baseline. No `-C target-cpu=native` exists anywhere in this
+//     family, and a binary built on this machine still has to run on one without
+//     AVX2; the vector path is compiled out entirely on a non-x86-64 target.
+//
+// WHAT NEITHER PATH CHANGES. Parallelism and vector width do not touch the sum.
+// One task owns each output row and accumulates it in the kernel's own order,
+// and lane j of the AXPY accumulates exactly the taps the scalar element j
+// would, in the same sequence. `selftest` asserts both halves of that: the
+// scalar inner loop through the same parallel framing is BIT-IDENTICAL to a
+// plain reference, and the vector path differs from it by the FMA alone.
+//
+// THE ONE REAL DIFFERENCE IS THE FMA. `fma(k, x, acc)` rounds once where a
+// scalar `acc + k * x` rounds twice - about 1e-7 relative, and it is the more
+// accurate of the two. It is also the direction the GPU kernel is already in,
+// because nvcc contracts `acc += wv * x` into an FMA, so the vector path moves
+// the CPU backend TOWARDS the kernels rather than away from them. Each of the
+// three engines' hand-written copies made this same trade; realesrgan-rs
+// documents it in these terms at its own copy.
+//
+// ORDER. The nullable bias is folded into the accumulator BEFORE the first
+// multiply, then the taps run ky, kx, ci - the order of the KERNEL. That is what
+// makes a twin-versus-kernel comparison a comparison of two implementations of
+// ONE sum; a twin that summed in an order of its own could only ever be compared
+// by tolerance. It is also NOT the order `conv3x3_tile`/`conv1x1_tile` use
+// (channel loop outermost, bias last), which is why the generic-to-tiled swap
+// stays the magnitude-bound swap those two kernels document.
+// ---------------------------------------------------------------------------
+
+/// `lg_conv1x1`: `y[oc][p] = bias[oc] + sum_c w[oc][c] * x[c][p]`, order c
+/// ascending with the bias in the accumulator first.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1x1(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize,
+) {
+    conv1x1_impl(x, w, bias, y, c_in, c_out, h, wd, simd_ok());
+}
+
+/// [`conv1x1`] with the inner loop selectable, so `selftest` can tell the FMA's
+/// last bit apart from the parallel framing.
+#[allow(clippy::too_many_arguments)]
+fn conv1x1_impl(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize, simd: bool,
+) {
+    let hw = h * wd;
+    if c_out == 0 || hw == 0 {
+        return;
+    }
+    let out = &mut y[..c_out * hw];
+    out.par_chunks_mut(wd).enumerate().for_each_init(
+        Vec::new,
+        |acc, (idx, orow)| {
+            let (oc, oy) = (idx / h, idx % h);
+            if acc.len() < wd {
+                acc.resize(wd, 0.0);
+            }
+            let row = &mut acc[..wd];
+            row.fill(if bias.is_empty() { 0.0 } else { bias[oc] });
+            let wp = &w[oc * c_in..(oc + 1) * c_in];
+            for (c, &k) in wp[..c_in].iter().enumerate() {
+                if k == 0.0 {
+                    continue;
+                }
+                let base = c * hw + oy * wd;
+                row_axpy(row, &x[base..base + wd], k, simd);
+            }
+            orow.copy_from_slice(row);
+        },
+    );
+}
+
+/// `lg_conv3x3s1p1`: 3x3, stride 1, pad 1, plane layout, nullable bias folded
+/// into the accumulator first, then ky, kx, ci.
+#[allow(clippy::too_many_arguments)]
+pub fn conv3x3s1p1(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize,
+) {
+    conv3x3s1p1_impl(x, w, bias, y, c_in, c_out, h, wd, simd_ok());
+}
+
+/// [`conv3x3s1p1`] with the inner loop selectable. See [`conv1x1_impl`].
+#[allow(clippy::too_many_arguments)]
+fn conv3x3s1p1_impl(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize, simd: bool,
+) {
+    conv3x3s1p1_with(x, w, bias, y, c_in, c_out, h, wd, simd, true)
+}
+
+/// [`conv3x3s1p1_impl`] with the channel PAIRING selectable. `pair = false` runs
+/// one channel a task; `pair = true` runs two and shares the loads. The two must
+/// agree BIT FOR BIT, and `selftest` asserts exactly that - the pairing is a
+/// schedule, not arithmetic, so if it can change an answer at all it is a bug.
+#[allow(clippy::too_many_arguments)]
+fn conv3x3s1p1_with(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize, simd: bool, pair: bool,
+) {
+    let hw = h * wd;
+    if c_out == 0 || hw == 0 {
+        return;
+    }
+    let out = &mut y[..c_out * hw];
+    let g = Row3x3 { x, c_in, hw, h, wd };
+    // ONE TASK PER OUTPUT-CHANNEL PAIR, and the rows of a pair are split across
+    // the pool as well. A pair chunk is `2*hw` of the output, so the two row
+    // slices a task needs are `chunk.split_at_mut(hw)` - which is the whole
+    // reason the pairing is expressible at all.
+    //
+    // The pair is worth this: eight FMAs per four loaded vectors, because one
+    // input load feeds BOTH output channels. Measured against the same tile
+    // driving one channel, the paired form is 1.1x-2.0x on every geometry
+    // measured (ifan-rs's 128->128 at 59x164, 118x328, 236x328, 472x164 and
+    // 59x1312, 64->64 at 236x656, 32->32 at 472x1312, 256->128 at 59x164) and
+    // 1.38x on the worse of the two independent runs. An odd `c_out` leaves a
+    // last chunk of ONE plane, which takes the unpaired row routine.
+    //
+    // The order is what makes this safe to choose by speed alone: the paired
+    // tile runs the same (ky, kx, ci) sequence with the bias already in the
+    // accumulator, so its output is BIT-IDENTICAL to the unpaired one, not
+    // merely close. `selftest` asserts that directly.
+    if !pair {
+        out.par_chunks_mut(wd).enumerate().for_each_init(
+            Vec::new,
+            |buf, (idx, orow)| {
+                let (oc, oy) = (idx / h, idx % h);
+                g.row(&w[oc * c_in * 9..(oc + 1) * c_in * 9], bias_at(bias, oc), oy, orow, buf, simd);
+            },
+        );
+        return;
+    }
+    out.par_chunks_mut(2 * hw).enumerate().for_each(|(p, chunk)| {
+        let (oc0, oc1) = (p * 2, p * 2 + 1);
+        let (plane0, rest) = chunk.split_at_mut(hw);
+        if oc1 >= c_out {
+            plane0.par_chunks_mut(wd).enumerate().for_each_init(
+                Vec::new,
+                |buf, (oy, orow)| {
+                    let wp = &w[oc0 * c_in * 9..(oc0 + 1) * c_in * 9];
+                    g.row(wp, bias_at(bias, oc0), oy, orow, buf, simd);
+                },
+            );
+            return;
+        }
+        let plane1 = &mut rest[..hw];
+        let wp0 = &w[oc0 * c_in * 9..(oc0 + 1) * c_in * 9];
+        let wp1 = &w[oc1 * c_in * 9..(oc1 + 1) * c_in * 9];
+        let (b0, b1) = (bias_at(bias, oc0), bias_at(bias, oc1));
+        plane0
+            .par_chunks_mut(wd)
+            .zip(plane1.par_chunks_mut(wd))
+            .enumerate()
+            .for_each_init(
+                || (Vec::new(), Vec::new()),
+                |bufs, (oy, (orow0, orow1))| {
+                    g.row_pair(
+                        [(wp0, b0), (wp1, b1)],
+                        oy,
+                        [orow0, orow1],
+                        (&mut bufs.0, &mut bufs.1),
+                        simd,
+                    );
+                },
+            );
+    });
+}
+
+/// A nullable bias read, in the one place both row routines agree on the rule.
+#[inline]
+fn bias_at(bias: &[f32], oc: usize) -> f32 {
+    if bias.is_empty() {
+        0.0
+    } else {
+        bias[oc]
+    }
+}
+
+/// The geometry and the input a 3x3 row pass needs, grouped so the row routines
+/// take a row index, a weight slice and a bias rather than ten arguments.
+///
+/// `Copy` so the closures below can hold it by value, which is what keeps the
+/// nested `rayon` iterators from fighting over a borrow.
+#[derive(Clone, Copy)]
+struct Row3x3<'a> {
+    x: &'a [f32],
+    c_in: usize,
+    hw: usize,
+    h: usize,
+    wd: usize,
+}
+
+impl Row3x3<'_> {
+    /// One output row of ONE output channel.
+    fn row(&self, wp: &[f32], b: f32, oy: usize, orow: &mut [f32], buf: &mut Vec<f32>, simd: bool) {
+        if buf.len() < self.wd {
+            buf.resize(self.wd, 0.0);
+        }
+        let acc = &mut buf[..self.wd];
+        acc.fill(b);
+        let tiled_end = self.tiles(wp, oy, acc, simd);
+        self.axpy(wp, oy, tiled_end, acc, simd);
+        orow.copy_from_slice(acc);
+    }
+
+    /// One output row of TWO output channels at once.
+    ///
+    /// The two channels arrive as arrays rather than as four arguments so that
+    /// "channel 0" and "channel 1" are one concept in the signature and not two
+    /// pairs of parameters that a caller could transpose.
+    fn row_pair(
+        &self, chs: [(&[f32], f32); 2], oy: usize, outs: [&mut [f32]; 2],
+        bufs: (&mut Vec<f32>, &mut Vec<f32>), simd: bool,
+    ) {
+        let [(wp0, b0), (wp1, b1)] = chs;
+        let [orow0, orow1] = outs;
+        let (buf0, buf1) = bufs;
+        for b in [&mut *buf0, &mut *buf1] {
+            if b.len() < self.wd {
+                b.resize(self.wd, 0.0);
+            }
+        }
+        let (acc0, acc1) = (&mut buf0[..self.wd], &mut buf1[..self.wd]);
+        acc0.fill(b0);
+        acc1.fill(b1);
+        let tiled_end = self.tiles_pair(wp0, wp1, oy, acc0, acc1, simd);
+        self.axpy(wp0, oy, tiled_end, acc0, simd);
+        self.axpy(wp1, oy, tiled_end, acc1, simd);
+        orow0.copy_from_slice(acc0);
+        orow1.copy_from_slice(acc1);
+    }
+
+    /// The 32-column register tiles across the interior of a row, for ONE output
+    /// channel, from column 1 to the last column a full tile fits in. Returns the
+    /// first column NO tile covered, or 0 if the row was too narrow for one -
+    /// which is how the caller knows the AXPY pass takes the whole row.
+    #[cfg(target_arch = "x86_64")]
+    fn tiles(&self, wp: &[f32], oy: usize, acc: &mut [f32], simd: bool) -> usize {
+        let mut x0 = 1usize;
+        if simd {
+            while x0 + TILE <= self.wd - 1 {
+                // SAFETY: `simd` is the AVX2+FMA runtime test, and the loop
+                // condition keeps x0 >= 1 and x0 + TILE + 1 <= wd, so every kx
+                // offset the tile reads is in bounds.
+                unsafe { row_tile3x3_avx2(self, wp, oy, x0, acc) };
+                x0 += TILE;
+            }
+        }
+        if x0 == 1 { 0 } else { x0 }
+    }
+
+    /// [`Self::tiles`] for TWO output channels, sharing every input load.
+    #[cfg(target_arch = "x86_64")]
+    fn tiles_pair(
+        &self, wp0: &[f32], wp1: &[f32], oy: usize,
+        acc0: &mut [f32], acc1: &mut [f32], simd: bool,
+    ) -> usize {
+        let mut x0 = 1usize;
+        if simd {
+            while x0 + TILE <= self.wd - 1 {
+                // SAFETY: as above, for both weight slices.
+                unsafe { row_tile3x3_pair_avx2(self, wp0, wp1, oy, x0, acc0, acc1) };
+                x0 += TILE;
+            }
+        }
+        if x0 == 1 { 0 } else { x0 }
+    }
+
+    /// Without AVX2 there is no tile: the AXPY form takes the whole row.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn tiles(&self, wp: &[f32], oy: usize, acc: &mut [f32], simd: bool) -> usize {
+        let _ = (wp, oy, acc, simd);
+        0
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn tiles_pair(
+        &self, wp0: &[f32], wp1: &[f32], oy: usize,
+        acc0: &mut [f32], acc1: &mut [f32], simd: bool,
+    ) -> usize {
+        let _ = (wp0, wp1, oy, acc0, acc1, simd);
+        0
+    }
+
+    /// The AXPY form for the columns the tiles did not write.
+    fn axpy(&self, wp: &[f32], oy: usize, tiled_end: usize, acc: &mut [f32], simd: bool) {
+        let segs: &[(usize, usize)] = if tiled_end == 0 {
+            &[(0, self.wd)]
+        } else {
+            &[(0, 1), (tiled_end, self.wd)]
+        };
+        for &(a, b) in segs {
+            for ky in 0..3usize {
+                let iy = oy as isize + ky as isize - 1;
+                if iy < 0 || iy >= self.h as isize {
+                    continue;
+                }
+                let srow = iy as usize * self.wd;
+                for kx in 0..3usize {
+                    // The output columns this tap reaches: kx = 0 loses column 0
+                    // to the left edge and kx = 2 loses the last column. Every
+                    // access inside the range below is in bounds by construction,
+                    // which is the whole point - the bounds test used to sit in
+                    // the innermost loop of a 27-tap sum.
+                    let lo = a.max(if kx == 0 { 1 } else { 0 });
+                    let hi = b.min(if kx == 2 { self.wd.wrapping_sub(1) } else { self.wd });
+                    if lo >= hi {
+                        continue;
+                    }
+                    for ci in 0..self.c_in {
+                        let k = wp[ci * 9 + ky * 3 + kx];
+                        if k == 0.0 {
+                            continue;
+                        }
+                        let base = ci * self.hw + srow + lo + kx - 1;
+                        row_axpy(&mut acc[lo..hi], &self.x[base..base + (hi - lo)], k, simd);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The tile width, in output columns, of [`row_tile3x3_avx2`] - four `__m256`
+/// accumulators. NOT a runtime value: the kernel's register allocation and the
+/// loop condition that has to keep every tap in bounds both depend on it.
+const TILE: usize = 32;
+
+/// One 32-column interior tile of one output row, with the accumulators in
+/// registers for ALL 27 taps.
+///
+/// The caller guarantees `x0 >= 1` and `x0 + TILE + 1 <= wd`, so all three `kx`
+/// offsets are in bounds and no tap is skipped or clamped. `acc` already holds
+/// the bias in every column; this adds the taps to it, in the same per-lane
+/// order as the AXPY path, so the two are interchangeable.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn row_tile3x3_avx2(g: &Row3x3, wp: &[f32], oy: usize, x0: usize, acc: &mut [f32]) {
+    use core::arch::x86_64::*;
+    let (x, c_in, hw, h, wd) = (g.x, g.c_in, g.hw, g.h, g.wd);
+    let xp = x.as_ptr();
+    let b = *acc.get_unchecked(x0);
+    let mut a0 = _mm256_set1_ps(b);
+    let mut a1 = a0;
+    let mut a2 = a0;
+    let mut a3 = a0;
+    for ky in 0..3usize {
+        let iy = oy as isize + ky as isize - 1;
+        if iy < 0 || iy >= h as isize {
+            continue;
+        }
+        let srow = iy as usize * wd;
+        for kx in 0..3usize {
+            for ci in 0..c_in {
+                let k = *wp.get_unchecked(ci * 9 + ky * 3 + kx);
+                if k == 0.0 {
+                    continue;
+                }
+                let kv = _mm256_set1_ps(k);
+                let p = xp.add(ci * hw + srow + x0 + kx - 1);
+                a0 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(p), a0);
+                a1 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(p.add(8)), a1);
+                a2 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(p.add(16)), a2);
+                a3 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(p.add(24)), a3);
+            }
+        }
+    }
+    let op = acc.as_mut_ptr().add(x0);
+    _mm256_storeu_ps(op, a0);
+    _mm256_storeu_ps(op.add(8), a1);
+    _mm256_storeu_ps(op.add(16), a2);
+    _mm256_storeu_ps(op.add(24), a3);
+}
+
+/// The same tile for TWO output channels at once: one `_mm256_loadu_ps` feeds an
+/// FMA into each channel's accumulator, so four loads issue eight FMAs.
+///
+/// This is the shape ifan-rs's own `conv3x3_row_tile2_avx2` has, and it is where
+/// its edge over a one-channel tile came from. The gain is not arithmetic - the
+/// same 27 multiplies per output happen either way - it is that the loads are
+/// shared, halving the load:FMA ratio of the inner loop.
+///
+/// The per-lane order is IDENTICAL to [`row_tile3x3_avx2`]: bias already in the
+/// accumulator, then ky, kx, ci, one FMA each, for both channels. So the two
+/// tiles produce bit-identical output and the `c_out` parity of a caller cannot
+/// change a result.
+///
+/// # Safety
+///
+/// Same guarantee as [`row_tile3x3_avx2`], for both weight slices: `x0 >= 1` and
+/// `x0 + TILE + 1 <= wd`, so every `kx` offset is in bounds.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn row_tile3x3_pair_avx2(
+    g: &Row3x3, wp0: &[f32], wp1: &[f32], oy: usize, x0: usize,
+    acc0: &mut [f32], acc1: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    let (x, c_in, hw, h, wd) = (g.x, g.c_in, g.hw, g.h, g.wd);
+    let xp = x.as_ptr();
+    let mut a = [_mm256_set1_ps(*acc0.get_unchecked(x0)); 4];
+    let mut b = [_mm256_set1_ps(*acc1.get_unchecked(x0)); 4];
+    for ky in 0..3usize {
+        let iy = oy as isize + ky as isize - 1;
+        if iy < 0 || iy >= h as isize {
+            continue;
+        }
+        let srow = iy as usize * wd;
+        for kx in 0..3usize {
+            for ci in 0..c_in {
+                let p = xp.add(ci * hw + srow + x0 + kx - 1);
+                let v0 = _mm256_loadu_ps(p);
+                let v1 = _mm256_loadu_ps(p.add(8));
+                let v2 = _mm256_loadu_ps(p.add(16));
+                let v3 = _mm256_loadu_ps(p.add(24));
+                let ka = _mm256_set1_ps(*wp0.get_unchecked(ci * 9 + ky * 3 + kx));
+                let kb = _mm256_set1_ps(*wp1.get_unchecked(ci * 9 + ky * 3 + kx));
+                a[0] = _mm256_fmadd_ps(ka, v0, a[0]);
+                a[1] = _mm256_fmadd_ps(ka, v1, a[1]);
+                a[2] = _mm256_fmadd_ps(ka, v2, a[2]);
+                a[3] = _mm256_fmadd_ps(ka, v3, a[3]);
+                b[0] = _mm256_fmadd_ps(kb, v0, b[0]);
+                b[1] = _mm256_fmadd_ps(kb, v1, b[1]);
+                b[2] = _mm256_fmadd_ps(kb, v2, b[2]);
+                b[3] = _mm256_fmadd_ps(kb, v3, b[3]);
+            }
+        }
+    }
+    let o0 = acc0.as_mut_ptr().add(x0);
+    let o1 = acc1.as_mut_ptr().add(x0);
+    for j in 0..4 {
+        _mm256_storeu_ps(o0.add(8 * j), a[j]);
+        _mm256_storeu_ps(o1.add(8 * j), b[j]);
+    }
+}
+
+/// `acc[i] += k * src[i]` for every i, as one contiguous AXPY: the loop the
+/// twin exists for.
+///
+/// `simd` is resolved ONCE per kernel call by the caller rather than re-tested
+/// per tap. `is_x86_feature_detected!` caches its answer, so the test is cheap,
+/// but a tap can be as short as a few elements and the branch would then be a
+/// real fraction of it; a tap loop is also not a place to make the vectoriser
+/// prove anything.
+#[inline]
+fn row_axpy(acc: &mut [f32], src: &[f32], k: f32, simd: bool) {
+    debug_assert_eq!(acc.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd {
+            // SAFETY: `simd_ok` is `is_x86_feature_detected!` for exactly the two
+            // features `row_axpy_avx2` is compiled with, and it is the only
+            // source of a `true`.
+            unsafe { row_axpy_avx2(acc, src, k) };
+            return;
+        }
+    }
+    let _ = simd;
+    for (a, s) in acc.iter_mut().zip(src.iter()) {
+        *a += k * *s;
+    }
+}
+
+/// AVX2 + FMA, or `false` where the CPU says it has neither. Both features are
+/// tested: `_mm256_fmadd_ps` is FMA, and a CPU with AVX2 alone would fault on it.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn simd_ok() -> bool {
+    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn simd_ok() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn row_axpy_avx2(acc: &mut [f32], src: &[f32], k: f32) {
+    use core::arch::x86_64::*;
+    let n = acc.len();
+    debug_assert_eq!(src.len(), n);
+    let kv = _mm256_set1_ps(k);
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let a = _mm256_loadu_ps(acc.as_ptr().add(i));
+        let s = _mm256_loadu_ps(src.as_ptr().add(i));
+        _mm256_storeu_ps(acc.as_mut_ptr().add(i), _mm256_fmadd_ps(kv, s, a));
+        i += 8;
+    }
+    // The tail is always evaluated: `n` is a row width, a runtime value nothing
+    // above can prove is a multiple of 8.
+    while i < n {
+        *acc.get_unchecked_mut(i) += k * *src.get_unchecked(i);
+        i += 1;
     }
 }
 
@@ -669,6 +1204,10 @@ fn bitrev(i: usize, nb: usize) -> usize {
     j
 }
 
+/// The toolkit's own smoke test: every twin must run and agree with a
+/// straightforward reimplementation on a fixed input. Called by `gpuinfo`, which
+/// is the completeness check for the pair (kernel, twin) - a kernel whose twin
+/// is missing or wrong is a CPU backend that cannot run the graph.
 pub fn selftest() -> Result<(), String> {
     // Roots of the norms must be exact for a constant input.
     let x = vec![3.0f32; 8];
@@ -865,6 +1404,230 @@ pub fn selftest() -> Result<(), String> {
             }
         }
     }
+
+    // ---- the generic convolutions, the toolkit's parallel twins ----------
+    //
+    // Two things are on trial here and they are separable, which is why the
+    // kernel has an inner-loop switch: the PARALLEL FRAMING (one rayon task per
+    // output channel and row, a contiguous accumulator, the bounds resolved per
+    // tap instead of per element) must change the answer EXACTLY never, and the
+    // VECTOR path (an FMA where the scalar code rounds twice) may change it in
+    // the last bit and nowhere else. A row that was dropped, mis-offset or
+    // double-counted is off by ~1; the vector path is off by ~1e-7.
+    {
+        // EVERY ROW WIDTH IN [1, 90], because the two inner forms cross over by
+        // width and the whole point of having both is that they are
+        // interchangeable. A width below TILE exercises only the AXPY path, a
+        // width above it exercises the register tile (and both, at the edges and
+        // the tail), and several widths here put the last tile flush against the
+        // right edge or leave remainders of 1..7 columns - the cases where a
+        // segment that is off by one column shows up as a value of ~1, not 1e-7.
+        // This sweep is what caught a real out-of-bounds tile on 64/65/67-wide
+        // rows in the prototype, which is why it is 90 widths rather than one.
+        for wd_probe in 1..=90usize {
+            let (ci, co, h) = (3usize, 2usize, 3usize);
+            let wd = wd_probe;
+            let plane = h * wd;
+            let x: Vec<f32> = (0..ci * plane).map(|i| ((i * 37 % 101) as f32 - 50.0) / 16.0).collect();
+            let w: Vec<f32> = (0..co * ci * 9).map(|i| ((i * 23 % 71) as f32 - 35.0) / 16.0).collect();
+            let b: Vec<f32> = (0..co).map(|i| (i as f32) / 4.0 - 0.5).collect();
+            let mut want = vec![0.0f32; co * plane];
+            for oc in 0..co {
+                for oy in 0..h {
+                    for ox in 0..wd {
+                        let mut acc = b[oc];
+                        for ky in 0..3usize {
+                            let iy = oy as isize + ky as isize - 1;
+                            if iy < 0 || iy >= h as isize {
+                                continue;
+                            }
+                            for kx in 0..3usize {
+                                let ix = ox as isize + kx as isize - 1;
+                                if ix < 0 || ix >= wd as isize {
+                                    continue;
+                                }
+                                for c in 0..ci {
+                                    acc += w[(oc * ci + c) * 9 + ky * 3 + kx]
+                                        * x[c * plane + iy as usize * wd + ix as usize];
+                                }
+                            }
+                        }
+                        want[(oc * h + oy) * wd + ox] = acc;
+                    }
+                }
+            }
+            // The scalar inner loop through the same framing: bit-identical.
+            let mut gs = vec![0.0f32; co * plane];
+            conv3x3s1p1_impl(&x, &w, &b, &mut gs, ci, co, h, wd, false);
+            if gs != want {
+                return Err(format!("conv3x3s1p1(wd={wd}): the framing changed the sum"));
+            }
+            // The vector path, tile and AXPY together: within the one FMA.
+            let mut gv = vec![0.0f32; co * plane];
+            conv3x3s1p1(&x, &w, &b, &mut gv, ci, co, h, wd);
+            let bound_w = if simd_ok() { 1e-5 } else { 0.0 };
+            for i in 0..co * plane {
+                if (gv[i] - want[i]).abs() > bound_w {
+                    return Err(format!(
+                        "conv3x3s1p1(wd={wd}) element {i}: {} vs {}, bound {bound_w}",
+                        gv[i], want[i]
+                    ));
+                }
+            }
+        }
+        // A tall-narrow and a wide-short image, so the row framing sees a row
+        // that is one task and a row that is many: the same arithmetic either way.
+        let (ci, co, h, wd) = (5usize, 4usize, 7usize, 7usize);
+        let plane = h * wd;
+        let x: Vec<f32> = (0..ci * plane).map(|i| ((i * 37 % 101) as f32 - 50.0) / 16.0).collect();
+        let w: Vec<f32> = (0..co * ci * 9).map(|i| ((i * 23 % 71) as f32 - 35.0) / 16.0).collect();
+        let b: Vec<f32> = (0..co).map(|i| (i as f32) / 4.0 - 0.5).collect();
+
+        // The twin's ARITHMETIC, written out independently, in the kernel's order:
+        // the nullable bias folded into the accumulator first, then ky, kx, ci.
+        let mut want = vec![0.0f32; co * plane];
+        for oc in 0..co {
+            for oy in 0..h {
+                for ox in 0..wd {
+                    let mut acc = b[oc];
+                    for ky in 0..3usize {
+                        let iy = oy as isize + ky as isize - 1;
+                        if iy < 0 || iy >= h as isize {
+                            continue;
+                        }
+                        for kx in 0..3usize {
+                            let ix = ox as isize + kx as isize - 1;
+                            if ix < 0 || ix >= wd as isize {
+                                continue;
+                            }
+                            for c in 0..ci {
+                                acc += w[(oc * ci + c) * 9 + ky * 3 + kx]
+                                    * x[c * plane + iy as usize * wd + ix as usize];
+                            }
+                        }
+                    }
+                    want[(oc * h + oy) * wd + ox] = acc;
+                }
+            }
+        }
+        // The scalar inner loop through the SAME parallel framing must be
+        // bit-identical to that reference: any difference is the framing's, and
+        // there must be none.
+        let mut got_scalar = vec![0.0f32; co * plane];
+        conv3x3s1p1_impl(&x, &w, &b, &mut got_scalar, ci, co, h, wd, false);
+        if got_scalar != want {
+            return Err("conv3x3s1p1: the parallel framing changed the sum".into());
+        }
+        // The vector path differs by the FMA alone - and by nothing at all on a
+        // CPU without AVX2 and FMA, where it IS the scalar path.
+        let mut got = vec![0.0f32; co * plane];
+        conv3x3s1p1(&x, &w, &b, &mut got, ci, co, h, wd);
+        let mut worst = 0.0f32;
+        for i in 0..co * plane {
+            let d = (got[i] - want[i]).abs();
+            if d > worst {
+                worst = d;
+            }
+        }
+        let bound = if simd_ok() { 1e-5 } else { 0.0 };
+        if worst > bound {
+            return Err(format!(
+                "conv3x3s1p1: worst |d| vs its own order is {worst}, expected {bound}"
+            ));
+        }
+
+        // THE CHANNEL PAIRING MUST BE INVISIBLE. `conv3x3s1p1` pairs output
+        // channels so one input load feeds two FMAs; that is a schedule, not
+        // arithmetic, so the paired and unpaired paths have to agree BIT FOR BIT.
+        // If they ever differ by even one ulp, the pairing has changed the sum,
+        // which means the two accumulators are not doing what this file says -
+        // and the width sweep above would not catch it, because it uses the
+        // default. An ODD `c_out` is included: that is the case where the last
+        // chunk holds one plane and takes the unpaired routine.
+        for c_out_probe in 2..=9usize {
+            let (ci, h, wd) = (3usize, 3usize, 41usize);
+            let plane = h * wd;
+            let x: Vec<f32> = (0..ci * plane).map(|i| ((i * 37 % 101) as f32 - 50.0) / 16.0).collect();
+            let w: Vec<f32> = (0..c_out_probe * ci * 9).map(|i| ((i * 23 % 71) as f32 - 35.0) / 16.0).collect();
+            let b: Vec<f32> = (0..c_out_probe).map(|i| (i as f32) / 4.0 - 0.5).collect();
+            let mut ys = vec![0.0f32; c_out_probe * plane];
+            let mut yp = vec![0.0f32; c_out_probe * plane];
+            conv3x3s1p1_with(&x, &w, &b, &mut ys, ci, c_out_probe, h, wd, simd_ok(), false);
+            conv3x3s1p1_with(&x, &w, &b, &mut yp, ci, c_out_probe, h, wd, simd_ok(), true);
+            if ys != yp {
+                return Err(format!(
+                    "conv3x3s1p1(c_out={c_out_probe}): the channel pairing changed the sum"
+                ));
+            }
+        }
+
+        // A null bias must mean exactly what a zero bias means, and the same for
+        // the 1x1 below: the kernels take a NULLABLE pointer, and a twin that
+        // indexed an empty slice instead would be reading out of bounds.
+        let zero = vec![0.0f32; co];
+        let mut yz = vec![0.0f32; co * plane];
+        let mut yn = vec![0.0f32; co * plane];
+        conv3x3s1p1(&x, &w, &zero, &mut yz, ci, co, h, wd);
+        conv3x3s1p1(&x, &w, &[], &mut yn, ci, co, h, wd);
+        if yz != yn {
+            return Err("conv3x3s1p1: a null bias differs from a zero bias".into());
+        }
+
+        // The same three checks for lg_conv1x1: order c ascending with the bias
+        // first, the framing exact, the vector path within an FMA.
+        let (ci1, co1, h1, wd1) = (6usize, 4usize, 3usize, 5usize);
+        let plane1 = h1 * wd1;
+        let x1: Vec<f32> = (0..ci1 * plane1).map(|i| ((i * 29 % 97) as f32 - 48.0) / 16.0).collect();
+        let w1: Vec<f32> = (0..co1 * ci1).map(|i| ((i * 13 % 41) as f32 - 20.0) / 16.0).collect();
+        let b1: Vec<f32> = (0..co1).map(|i| (i as f32) / 3.0 - 0.5).collect();
+        let mut want1 = vec![0.0f32; co1 * plane1];
+        for o in 0..co1 {
+            for p in 0..plane1 {
+                let mut acc = b1[o];
+                for c in 0..ci1 {
+                    acc += w1[o * ci1 + c] * x1[c * plane1 + p];
+                }
+                want1[o * plane1 + p] = acc;
+            }
+        }
+        let mut got1_scalar = vec![0.0f32; co1 * plane1];
+        conv1x1_impl(&x1, &w1, &b1, &mut got1_scalar, ci1, co1, h1, wd1, false);
+        if got1_scalar != want1 {
+            return Err("conv1x1: the parallel framing changed the sum".into());
+        }
+        let mut got1 = vec![0.0f32; co1 * plane1];
+        conv1x1(&x1, &w1, &b1, &mut got1, ci1, co1, h1, wd1);
+        let mut worst1 = 0.0f32;
+        for i in 0..co1 * plane1 {
+            let d = (got1[i] - want1[i]).abs();
+            if d > worst1 {
+                worst1 = d;
+            }
+        }
+        if worst1 > bound {
+            return Err(format!(
+                "conv1x1: worst |d| vs its own order is {worst1}, expected {bound}"
+            ));
+        }
+        let zero1 = vec![0.0f32; co1];
+        let mut yz1 = vec![0.0f32; co1 * plane1];
+        let mut yn1 = vec![0.0f32; co1 * plane1];
+        conv1x1(&x1, &w1, &zero1, &mut yz1, ci1, co1, h1, wd1);
+        conv1x1(&x1, &w1, &[], &mut yn1, ci1, co1, h1, wd1);
+        if yz1 != yn1 {
+            return Err("conv1x1: a null bias differs from a zero bias".into());
+        }
+        // conv1x1_rb is the SAME operator and the SAME order, so a swap between
+        // them is an equality check - and since both are serial in c ascending
+        // with the bias in the accumulator from the start, they must agree
+        // exactly, not to a tolerance.
+        let mut yrb = vec![0.0f32; co1 * plane1];
+        conv1x1_rb(&x1, &w1, &b1, &mut yrb, ci1, co1, h1, wd1);
+        if yrb != want1 {
+            return Err("conv1x1_rb disagrees with conv1x1's order".into());
+        }
+    }
+
     // ---- the promoted kernels (section 12 of cuda/kernels.cu) ----
     {
         // lg_linear_rb must reproduce lg_linear EXACTLY: same op, same order.
@@ -1188,4 +1951,18 @@ pub fn selftest() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// `gpuinfo` runs the twin selftest, and `cargo test` did not - so the
+    /// correctness of the CPU backend was exercised only by a command a
+    /// contributor has to remember to type, while the JSON and safetensors
+    /// parsers were covered here. This calls the SAME function rather than a
+    /// copy of it, and it is the check that fails when a twin is added to the op
+    /// table with arithmetic that does not match its kernel.
+    #[test]
+    fn twins_agree_with_their_reference_orders() {
+        super::selftest().expect("cpu twin selftest");
+    }
 }

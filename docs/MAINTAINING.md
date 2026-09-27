@@ -92,6 +92,34 @@ Consumer-specific kernels can be compiled alongside toolkit kernels with
 preserves entry pruning and separate namespaces. See the build helper API and
 consumer `build.rs` files for the exact invocation.
 
+### The same move on the CPU side
+
+`src/ops/cpu.rs` is where the same argument applies to the other half of an
+engine. A twin is the path a machine with no driver takes, so it is not a test
+harness and is held to the same standard as the kernel - and the convolutions are
+where that bites: in ifan-rs at 256x256 the 3x3s are 72.7% of a CPU pass, and
+THREE engines had each written their own AVX2 + rayon copy of that one op. A
+"plain Rust, obviously correct" twin was not the conservative choice there; it was
+a fifth copy, and a slow one.
+
+So a twin may be parallel and vectorised, and `conv1x1`/`conv3x3s1p1` are, under
+two rules that are not negotiable:
+
+* the SIMD path is resolved at RUN time (`is_x86_feature_detected!`) and compiled
+  out on a target that is not x86-64. Nothing in this family sets
+  `-C target-cpu=native` or raises the baseline, and a binary built here has to
+  run on a machine without AVX2;
+* a twin may not choose its own SUMMATION ORDER - see `cuda/CONVENTIONS.md`
+  section 4. Parallelism and vector width do not touch a sum; a reordered sum
+  does. `ops::cpu::selftest` asserts that the scalar inner loop through the
+  parallel framing is BIT-IDENTICAL to a plain reference, and that the vector path
+  is within the single FMA it issues.
+
+`rayon` is a dependency of the toolkit for this reason and only this reason.
+Every engine in the family that runs a real model already depends on it and uses
+it for the same work (nine of ten; the tenth is a CPU-only toolset), so it adds no
+crate to an engine build that did not already have one.
+
 ## Debugging shared-kernel regressions
 
 The toolkit's self-test and `gpuinfo` completeness check do not replace testing a

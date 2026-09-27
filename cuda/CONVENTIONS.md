@@ -105,6 +105,19 @@ that dominate.
   fast math, no flush-to-zero. Every kernel has an arithmetic twin on the CPU and
   the two must agree, so the GPU side may not win precision by dropping IEEE
   behaviour.
+* A CPU twin may be PARALLEL and VECTORISED, and the two convolutions are
+  (`conv1x1`, `conv3x3s1p1`: `rayon`, an AVX2 + FMA inner loop behind a runtime
+  `is_x86_feature_detected!` test). Three engines had written their own copy of
+  that one op, so a slow twin was not the safe choice - it was a fifth copy. What
+  a twin may never do is choose its own SUMMATION ORDER: parallelism and vector
+  width do not touch a sum, while a reordered sum does, and would turn every
+  backend comparison into a tolerance. So the tile and the AXPY form have to agree
+  per element, a pair of output channels sharing one load has to agree with one
+  channel at a time, and `ops::cpu::selftest` asserts all of it: the scalar path
+  through the same parallel framing is BIT-IDENTICAL to a plain reference, the
+  vector path is within the one FMA it issues (`fmad=true` puts the GPU kernel in
+  the same place, so the twin moves towards the kernel, not away), and the paired
+  path is bit-identical to the unpaired one for every `c_out` from 2 to 9.
 * Reductions keep the CPU twin's summation order where that is cheap, so a
   backend mismatch points at a bug rather than at floating-point reordering.
   Where the order does differ, the kernel says so.
@@ -118,7 +131,9 @@ that dominate.
 2. Add the CPU twin in `src/ops/cpu.rs`, same name, same arithmetic order.
 3. Re-run `gpuinfo`: it resolves every name in `src/ops/mod.rs` against the
    loaded module, so a kernel that is added to the `.cu` but not to the table
-   (or vice versa) fails the smoke test rather than a caller's first launch.
+   (or vice versa) fails the smoke test rather than a caller's first launch. It
+   also runs `ops::cpu::selftest`, and `cargo test` runs the same function, so an
+   op with a wrong twin fails here too - a twin is not optional.
 4. If the kernel is one of a pair where two implementations are both worth
    keeping, keep both and document the crossover point, as the attention
    section does.

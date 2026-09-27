@@ -20,9 +20,10 @@ A dependency-light CUDA toolkit for building small inference engines without
 reimplementing the plumbing each time: the driver layer, the kernel set, and the
 CPU backend that keeps an engine running where there is no GPU, in one place.
 
-It exists because three engines in the family had grown their own copies of the same four
+It exists because three engines in the family had grown their own copies of the same five
 things - the `dlopen` driver bindings, the nvcc/fatbin build, the launch and
-buffer layer, and a duplicate-but-different kernel for the same operation.
+buffer layer, a duplicate-but-different kernel for the same operation, and a
+hand-written AVX2 + rayon CPU convolution each.
 
 ## Layers
 
@@ -31,13 +32,28 @@ buffer layer, and a duplicate-but-different kernel for the same operation.
 | `lightgpu` `::ffi` | the CUDA driver API, `dlopen`ed at run time | you want no CUDA toolkit, no bindgen and no build-time dependency beyond `libc` |
 | `lightgpu` `::vm` | `Module`, `DevBuf`, `Launch`, `Args` - one place that marshals pointers into `cuLaunchKernel` | you are writing an engine's `cuda.rs` |
 | `lightgpu` `::ops` | the kernel name table and each op's layout contract | you want to know what is available, or resolve a kernel by name |
+| `lightgpu` `::ops::cpu` | the CPU twin of each kernel, kept at the kernel's accumulation order | you are writing the branch of an engine that runs with no GPU |
 | `lightgpu-build` | `fatbin("cuda/kernels.cu", "kernels.fatbin")` for your `build.rs` | you have your own kernels and want the arch list and numeric flags in one place |
 
 Everything CUDA-related is inert unless the `cuda` feature is on, so
-`--no-default-features` gives a pure-Rust CPU build with no CUDA toolchain - the
-same convention every consumer engine uses. The pure-Rust layers (`json`, `mmap`,
+`--no-default-features` gives a CPU build with no CUDA toolchain - the same
+convention every consumer engine uses. The CPU layers (`json`, `mmap`,
 `safetensors`, `ops`' CPU twins) are not behind it: they have no CUDA dependency
 and are always compiled.
+
+The CPU twins are to the GPU backend what the [layers above](#layers) are to
+each engine: they were duplicated, they are metered, and they live here. The
+elementwise ones are plain scalar Rust. The convolutions are not - `conv1x1` and
+`conv3x3s1p1` are parallel and vectorised, with an AVX2 + FMA path selected by a
+RUNTIME `is_x86_feature_detected!` test, so a binary built on this machine still
+runs on one without AVX2 and the vector code is compiled out on any other target.
+`conv3x3s1p1` runs one `rayon` task per PAIR of output channels (a pair shares
+every input load, which is worth 1.1x-2.0x over one channel a task) and holds 32
+columns of each in registers across all 27 taps. Every form accumulates in the
+KERNEL's order - the bias first, then `ky`, `kx`, `ci` - so a CPU-vs-GPU
+difference is a difference and not a rounding, and `ops::cpu::selftest` asserts
+both halves of that: that the parallel framing is bit-identical to a plain
+reference and that the vector path differs only by the one FMA it issues.
 
 ## What is in the kernel set
 
@@ -114,8 +130,8 @@ device    : NVIDIA GeForce GTX 1080 (sm_61)
 SMs       : 20
 smem/block: 49152 bytes
 free VRAM : 7.82 GiB
-fatbin    : 1128152 bytes
-kernels   : 48 resolved in the module
+fatbin    : 2392672 bytes
+kernels   : 57 resolved in the module
 launch    : lg_noop(1,1) ok
 cpu twins : ok
 ```
