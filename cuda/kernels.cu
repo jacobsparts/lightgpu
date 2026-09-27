@@ -2057,6 +2057,297 @@ extern "C" __global__ void lg_layer_norm_warp(
 }
 
 // ---------------------------------------------------------------------------
+// The tiled convolution: 3x3 stride-1 pad-1 and 1x1, staged in shared memory.
+//
+// THESE ARE ALTERNATIVE IMPLEMENTATIONS of `lg_conv3x3s1p1` and `lg_conv1x1`,
+// not new operators. Same NCHW layout, same weight layout ([c_out][c_in][2+][2+]
+// with ci contiguous across the taps), same nullable bias. What changes is WHERE
+// THE REUSE COMES FROM. Section 6's kernels give one thread one output element
+// held in one register, so the inner loop is a serial FMA chain behind a fresh
+// load of both operands every iteration - fine when the input is the bottleneck
+// and the bottleneck is DRAM, but it leaves the FMA pipes idle: measured at 89
+// to 224 GFLOP/s on an sm_61 card, against the 1600-2067 this reaches. Here a
+// block stages a tile of the input in shared memory and each thread holds
+// OC_TILE accumulators over TPX pixels, so one input value serves every output
+// channel in the tile and the shared traffic is TPX + OC_TILE loads for
+// OC_TILE * TPX multiply-adds.
+//
+// THE ACCUMULATION ORDER IS THEREFORE DIFFERENT, AND THAT IS NOT A BUG TO FIX:
+// (ci, ky, kx) instead of section 6's (ky, kx, ci). Staging channels in tiles
+// makes the channel tile the OUTER loop; keeping (ky, kx, ci) would need every
+// one of c_in channels resident at once, which is 166 KB of shared memory for 32
+// channels of a 130x10 tile against a 48 KB limit. Two consequences follow that
+// a caller has to accept rather than work around:
+//
+//   * THE RESULT IS NOT BIT-IDENTICAL to `lg_conv3x3s1p1`. Measured on 32->32 at
+//     128x128 with the activation off: 489413 of 524288 elements differ, worst
+//     2.03e-06. This is a magnitude-bound swap, NOT the equality swap that
+//     `lg_conv1x1_rb`/`lg_linear_rb` offer for their operators - a caller that
+//     needs bit-exactness must keep the section 6 kernel for that op;
+//   * the halo is ZERO-FILLED rather than skipped, which is the same sum with
+//     zeros added: harmless in itself, and the same class of last-bit movement.
+//
+// WHAT THEY ARE WORTH, measured against the kernels they duplicate on an idle
+// GTX 1080, minimum of five reps, three tensors resident per launch so the
+// memory-bound forms are not penalised:
+//
+//     3x3  32->32     512x512    2.99 ms   1618 GFLOP/s    28.85 ms    167   9.7x
+//     3x3  128->128   512x512   37.4  ms   2067           683.2  ms    113  18.3x
+//     3x3  3->32      512x512    0.50 ms    903             5.10 ms     89  10.2x
+//     3x3  64->64     720x720   20.7  ms   1845           336.3  ms    114  16.2x
+//     3x3  32->32     1080p     23.6  ms   1620           170.9  ms    224   7.2x
+//     1x1  128->128   512x512   13.4  ms   5767            71.6  ms   1080   5.3x
+//     1x1  128->15232 64x128    48.4  ms   5936           197.6  ms   1455   4.1x
+//     1x1  128->15232 64x64     46.5  ms   3091            33.3  ms   4310   0.7x
+//
+// ONE GEOMETRY SERVES EVERY CHANNEL COUNT for the 3x3 - c_in 3, 32, 64 and 128
+// all win, at 512x512 and at 1080p - which is why it is offered as a general op
+// rather than as a tuned special case.
+//
+// THE 1x1 IS MORE NARROWLY USEFUL and is here for the case it was written for: a
+// very wide output (15232 channels) over a small plane, where the cost is the
+// INPUT RE-READ (c_out/OC passes over the same input) rather than the
+// arithmetic. It LOSES at 64x64 because there is not enough spatial extent to
+// amortise that, so a caller with a small plane and many input channels should
+// use `lg_conv1x1` or `lg_conv1x1_rb` instead. Note the three 1x1 forms differ
+// in exactly one respect each: `lg_conv1x1` and `lg_conv1x1_rb` agree bit for
+// bit (bias first, c ascending), and this one neither agrees with them nor is
+// ordered like them, which is why it is a separate name rather than a
+// replacement.
+//
+// SHARED MEMORY IS STATIC AND SIZED PER KERNEL. nvcc sizes DYNAMIC shared memory
+// for the whole kernel, so one kernel cannot let an instantiation pick its own
+// tile shape; each kernel below therefore carries its own arrays and derives the
+// staged extent from its own constants. The 3x3's cost is 42752 bytes -
+// sh[8][10][130] for an eight-channel tile of a 130x10 halo'd region plus
+// sw[8][4][9] for its weights - which is inside sm_75's 48 KB static limit with
+// room for three blocks an SM, so no opt-in carveout is needed on any target
+// this toolkit builds (the 64 KiB opt-in is only required from sm_80 up) and
+// neither launch calls cudaFuncSetAttribute.
+// ---------------------------------------------------------------------------
+
+// A 32x8 block with four columns per thread: a 128x8 output tile, and 32
+// accumulators per thread. The columns a thread owns are TBX apart rather than
+// adjacent, so that consecutive threads read consecutive shared addresses; four
+// adjacent columns per thread would make every shared load a four-way bank
+// conflict. The staged region is one column and one row wider than the output
+// tile at each edge, which IS the 3x3's pad of 1.
+constexpr int LG_C3_TBX = 32, LG_C3_TBY = 8, LG_C3_TPX = 4;
+constexpr int LG_C3_TW = LG_C3_TBX * LG_C3_TPX;   // 128 output columns per tile
+constexpr int LG_C3_TH = LG_C3_TBY;               // 8 output rows per tile
+constexpr int LG_C3_CI = 4;                       // input channels per staged tile
+constexpr int LG_C3_OC = 8;                       // accumulators per thread
+constexpr int LG_C3_SW = LG_C3_TW + 2;            // staged width, with the halo
+constexpr int LG_C3_SH = LG_C3_TH + 2;            // staged height, with the halo
+
+// out[oc][y][x] = act(bias[oc] + sum_{ci,ky,kx} w[oc][ci][ky][kx]
+//                                      * in[ci][y+ky-1][x+kx-1])
+// Weight layout [c_out][c_in][3][3], ci contiguous. ORDER: ci, ky, kx - see the
+// block comment above for why that is not the section 6 order.
+// act: 0 none, 1 relu, 2 leaky relu with `act_p` as the slope (the convention
+// `lg_conv3x3_winograd` uses).
+// grid = (ceil(wd/128), ceil(h/8), ceil(c_out/8)), block = (32,8,1).
+extern "C" __global__ void __launch_bounds__(LG_C3_TBX * LG_C3_TBY) lg_conv3x3_tile(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int wd, int act, float act_p)
+{
+    __shared__ float sh[LG_C3_CI][LG_C3_SH][LG_C3_SW];
+    __shared__ float sw[LG_C3_OC][LG_C3_CI][9];
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * LG_C3_TBX + tx;
+    const int ox0 = blockIdx.x * LG_C3_TW;
+    const int oy0 = blockIdx.y * LG_C3_TH;
+    const int oc0 = blockIdx.z * LG_C3_OC;
+    // The input column and row the staged tile starts at: the output tile's
+    // origin shifted back by the pad.
+    const int gx0 = ox0 - 1, gy0 = oy0 - 1;
+
+    float acc[LG_C3_OC][LG_C3_TPX];
+#pragma unroll
+    for (int o = 0; o < LG_C3_OC; ++o)
+#pragma unroll
+        for (int p = 0; p < LG_C3_TPX; ++p) acc[o][p] = 0.0f;
+
+    for (int ci0 = 0; ci0 < c_in; ci0 += LG_C3_CI) {
+        // Stage the input tile. Out-of-range positions are ZERO, which is what
+        // the padded convolution's boundary contributes, so the compute loop
+        // below needs no boundary test at all. A channel tile past c_in is also
+        // zero, and contributes nothing for the same reason.
+#pragma unroll
+        for (int k = 0; k < LG_C3_CI; ++k) {
+            const int ci = ci0 + k;
+            for (int i = tid; i < LG_C3_SW * LG_C3_SH; i += LG_C3_TBX * LG_C3_TBY) {
+                const int sy = i / LG_C3_SW;
+                const int sx = i - sy * LG_C3_SW;
+                const int gy = gy0 + sy;
+                const int gx = gx0 + sx;
+                float v = 0.0f;
+                if (ci < c_in && gy >= 0 && gy < h && gx >= 0 && gx < wd)
+                    v = in[((size_t)ci * h + gy) * wd + gx];
+                sh[k][sy][sx] = v;
+            }
+        }
+        // Stage this tile's weights in the (oc, ci, tap) order the compute loop
+        // reads them in, for the same reason.
+        for (int i = tid; i < LG_C3_OC * LG_C3_CI * 9; i += LG_C3_TBX * LG_C3_TBY) {
+            const int o = i / (LG_C3_CI * 9);
+            const int r = i - o * (LG_C3_CI * 9);
+            const int k = r / 9;
+            const int t = r - k * 9;
+            const int oc = oc0 + o, ci = ci0 + k;
+            float v = 0.0f;
+            if (oc < c_out && ci < c_in) v = w[((size_t)oc * c_in + ci) * 9 + t];
+            sw[o][k][t] = v;
+        }
+        __syncthreads();
+
+        // Per (ci, ky, kx) the TPX input values are loaded once and reused for
+        // every output channel in the tile, and each weight is loaded once and
+        // reused for every pixel.
+#pragma unroll
+        for (int k = 0; k < LG_C3_CI; ++k)
+#pragma unroll
+            for (int ky = 0; ky < 3; ++ky)
+#pragma unroll
+                for (int kx = 0; kx < 3; ++kx) {
+                    float v[LG_C3_TPX];
+#pragma unroll
+                    for (int p = 0; p < LG_C3_TPX; ++p)
+                        v[p] = sh[k][ty + ky][tx + p * LG_C3_TBX + kx];
+#pragma unroll
+                    for (int o = 0; o < LG_C3_OC; ++o) {
+                        const float wv = sw[o][k][ky * 3 + kx];
+#pragma unroll
+                        for (int p = 0; p < LG_C3_TPX; ++p) acc[o][p] += wv * v[p];
+                    }
+                }
+        // The next channel tile overwrites `sh`, so every reader must be done.
+        __syncthreads();
+    }
+
+    // The bias is added once, after the whole sum. The output is the same size
+    // as the input (stride 1, pad 1), so the tile indices are already output
+    // coordinates.
+    const int my = oy0 + ty;
+#pragma unroll
+    for (int o = 0; o < LG_C3_OC; ++o) {
+        const int oc = oc0 + o;
+        if (oc < c_out && my < h) {
+            const float b = bias ? bias[oc] : 0.0f;
+#pragma unroll
+            for (int p = 0; p < LG_C3_TPX; ++p) {
+                const int gx = ox0 + tx + p * LG_C3_TBX;
+                if (gx < wd) {
+                    float v = acc[o][p] + b;
+                    if (act == 1) v = v > 0.0f ? v : 0.0f;
+                    else if (act == 2) v = v >= 0.0f ? v : act_p * v;
+                    out[((size_t)oc * h + my) * wd + gx] = v;
+                }
+            }
+        }
+    }
+}
+
+// The same block structure for the 1x1, with a WIDE channel tile instead of a
+// halo. A 1x1 has no spatial reuse to stage - one input value serves one output
+// pixel - so the shared tile only exists to be re-read once per output-channel
+// tile, and what a wide OC buys is fewer passes over the input: at 15232 output
+// channels an 8-channel tile re-reads the input 1904 times and a 32-channel tile
+// 476 times. The channel tile is 4 rather than 8 because at KW = KH = 1 the
+// staged tile is exactly the output tile, so a wider one costs nothing but
+// registers in the staging loop.
+constexpr int LG_C1_TBX = 32, LG_C1_TBY = 4, LG_C1_TPX = 4;
+constexpr int LG_C1_TW = LG_C1_TBX * LG_C1_TPX;   // 128 output columns per tile
+constexpr int LG_C1_TH = LG_C1_TBY;               // 4 output rows per tile
+constexpr int LG_C1_CI = 4;
+constexpr int LG_C1_OC = 32;
+
+// out[oc][y][x] = act(bias[oc] + sum_ci w[oc][ci] * in[ci][y][x])
+// Weight layout [c_out][c_in]. ORDER: ci.
+// grid = (ceil(wd/128), ceil(h/4), ceil(c_out/32)), block = (32,4,1).
+extern "C" __global__ void __launch_bounds__(LG_C1_TBX * LG_C1_TBY) lg_conv1x1_tile(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int wd, int act, float act_p)
+{
+    __shared__ float sh[LG_C1_CI][LG_C1_TH][LG_C1_TW];
+    __shared__ float sw[LG_C1_OC][LG_C1_CI];
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * LG_C1_TBX + tx;
+    const int ox0 = blockIdx.x * LG_C1_TW;
+    const int oy0 = blockIdx.y * LG_C1_TH;
+    const int oc0 = blockIdx.z * LG_C1_OC;
+
+    float acc[LG_C1_OC][LG_C1_TPX];
+#pragma unroll
+    for (int o = 0; o < LG_C1_OC; ++o)
+#pragma unroll
+        for (int p = 0; p < LG_C1_TPX; ++p) acc[o][p] = 0.0f;
+
+    for (int ci0 = 0; ci0 < c_in; ci0 += LG_C1_CI) {
+#pragma unroll
+        for (int k = 0; k < LG_C1_CI; ++k) {
+            const int ci = ci0 + k;
+            for (int i = tid; i < LG_C1_TW * LG_C1_TH; i += LG_C1_TBX * LG_C1_TBY) {
+                const int sy = i / LG_C1_TW;
+                const int sx = i - sy * LG_C1_TW;
+                const int gy = oy0 + sy;
+                const int gx = ox0 + sx;
+                float v = 0.0f;
+                if (ci < c_in && gy < h && gx < wd)
+                    v = in[((size_t)ci * h + gy) * wd + gx];
+                sh[k][sy][sx] = v;
+            }
+        }
+        for (int i = tid; i < LG_C1_OC * LG_C1_CI; i += LG_C1_TBX * LG_C1_TBY) {
+            const int o = i / LG_C1_CI;
+            const int k = i - o * LG_C1_CI;
+            const int oc = oc0 + o, ci = ci0 + k;
+            float v = 0.0f;
+            if (oc < c_out && ci < c_in) v = w[(size_t)oc * c_in + ci];
+            sw[o][k] = v;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int k = 0; k < LG_C1_CI; ++k) {
+            float v[LG_C1_TPX];
+#pragma unroll
+            for (int p = 0; p < LG_C1_TPX; ++p) v[p] = sh[k][ty][tx + p * LG_C1_TBX];
+#pragma unroll
+            for (int o = 0; o < LG_C1_OC; ++o) {
+                const float wv = sw[o][k];
+#pragma unroll
+                for (int p = 0; p < LG_C1_TPX; ++p) acc[o][p] += wv * v[p];
+            }
+        }
+        __syncthreads();
+    }
+
+    const int my = oy0 + ty;
+#pragma unroll
+    for (int o = 0; o < LG_C1_OC; ++o) {
+        const int oc = oc0 + o;
+        if (oc < c_out && my < h) {
+            const float b = bias ? bias[oc] : 0.0f;
+#pragma unroll
+            for (int p = 0; p < LG_C1_TPX; ++p) {
+                const int gx = ox0 + tx + p * LG_C1_TBX;
+                if (gx < wd) {
+                    float v = acc[o][p] + b;
+                    if (act == 1) v = v > 0.0f ? v : 0.0f;
+                    else if (act == 2) v = v >= 0.0f ? v : act_p * v;
+                    out[((size_t)oc * h + my) * wd + gx] = v;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The stride-2 2x2 pair.
 //
 // Both give one thread one output pixel of EIGHT output channels. At stride 2 a

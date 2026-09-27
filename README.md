@@ -41,7 +41,7 @@ and are always compiled.
 
 ## What is in the kernel set
 
-55 kernels - the generic ops engines share, plus the machinery to prove
+57 kernels - the generic ops engines share, plus the machinery to prove
 them. Each consumer compiles only the subset it calls:
 
 * **norms** - `rms_norm`, `layer_norm` (one-pass E[x^2]-mean^2 by default,
@@ -61,9 +61,11 @@ them. Each consumer compiles only the subset it calls:
   global average pool - listed under reductions as well as above because that is
   what it is)
 * **convolutions** - `conv1x1`, `conv3x3s1p1`, `conv3x3_winograd`
-  (F(4x4,3x3), the same op at 4/9ths the multiplies), `conv4x4s4`, `conv_kxk`,
-  `linear_1x1`, and the stride-2 pair `conv2x2s2` (plane layout) /
-  `conv_t2x2` (token layout)
+  (F(4x4,3x3), the same op at 4/9ths the multiplies), `conv3x3_tile` (the tiled
+  form: 9.7x-18.3x `conv3x3s1p1` across c_in 3 to 128, at the cost of a
+  different accumulation order), `conv4x4s4`, `conv_kxk`, `linear_1x1`,
+  `conv1x1_tile` (for a very wide output over a small plane), and the stride-2
+  pair `conv2x2s2` (plane layout) / `conv_t2x2` (token layout)
 * **vision I/O and layout** - `upsample2x_nearest` (the integer-halving form),
   `pixel_unshuffle2` (space-to-depth with PyTorch's channel order), `lrelu`
   (slope as an argument), `add_scaled` (`a + s*b`, the fused residual)
@@ -195,7 +197,7 @@ override and the evident relative locations as a fallback.
 
 * **`-lineinfo` makes `--entries` a no-op.** In nvcc 12.4 a build with line
   tables keeps every kernel: the same 24-kernel list produced 1,151,688 B with
-  all 56 reachable instead of 415,448 B with none. It is off by default here;
+  all 57 reachable instead of 415,448 B with none. It is off by default here;
   set `LA_CUDA_LINEINFO=1` only for profiling, and re-check your binary size.
 * **nvcc does not reliably overwrite an existing `-o` fatbin.** `fatbin_entries`
   deletes the output first - without that, a stale wider image from an earlier

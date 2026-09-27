@@ -420,6 +420,96 @@ pub fn conv1x1_rb(
     }
 }
 
+/// `lg_conv3x3_tile`: 3x3, stride 1, pad 1 - the same operator as
+/// `lg_conv3x3s1p1`, accumulated in the TILED kernel's order.
+///
+/// TWO THINGS HERE ARE THE CONTRACT AND NOT STYLE. The channel loop is OUTERMOST
+/// (ci, then ky, then kx) because in the kernel the channel tile has to be the
+/// outer loop, and the BIAS IS ADDED AFTER THE SUM where `lg_conv3x3s1p1` folds it
+/// into the accumulator first. So this twin and a section-6-order twin agree only
+/// to rounding, and the selftest checks it against a reference in THIS order
+/// rather than against `lg_conv3x3s1p1`'s. The halo is zero-filled, which is the
+/// same sum with zeros added.
+///
+/// `act`: 0 none, 1 relu, 2 leaky relu with `act_p` as the slope - the
+/// `lg_conv3x3_winograd` convention, not ifan's 0/1 flag.
+pub fn conv3x3_tile(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize, act: u32, act_p: f32,
+) {
+    let plane = h * wd;
+    for oc in 0..c_out {
+        let b = if bias.is_empty() { 0.0f32 } else { bias[oc] };
+        for oy in 0..h {
+            for ox in 0..wd {
+                let mut acc = 0.0f32;
+                for ci in 0..c_in {
+                    let wp = (oc * c_in + ci) * 9;
+                    for ky in 0..3 {
+                        let iy = oy as isize + ky as isize - 1;
+                        if iy < 0 || iy >= h as isize {
+                            continue;
+                        }
+                        for kx in 0..3 {
+                            let ix = ox as isize + kx as isize - 1;
+                            if ix < 0 || ix >= wd as isize {
+                                continue;
+                            }
+                            acc += x[ci * plane + iy as usize * wd + ix as usize]
+                                * w[wp + ky * 3 + kx];
+                        }
+                    }
+                }
+                let v = activate(acc + b, act, act_p);
+                y[(oc * h + oy) * wd + ox] = v;
+            }
+        }
+    }
+}
+
+/// `lg_conv1x1_tile`: the same operator as `lg_conv1x1`, accumulated in the
+/// tiled kernel's order - c ascending, and the BIAS ADDED AFTER THE SUM where
+/// `lg_conv1x1` and `lg_conv1x1_rb` both fold it in first. That single
+/// difference is why all three are separate entries and why only the 1x1's two
+/// section-6 forms are bit-compatible with each other.
+pub fn conv1x1_tile(
+    x: &[f32], w: &[f32], bias: &[f32], y: &mut [f32],
+    c_in: usize, c_out: usize, h: usize, wd: usize, act: u32, act_p: f32,
+) {
+    let plane = h * wd;
+    for oc in 0..c_out {
+        let b = if bias.is_empty() { 0.0f32 } else { bias[oc] };
+        for p in 0..plane {
+            let mut acc = 0.0f32;
+            for c in 0..c_in {
+                acc += w[oc * c_in + c] * x[c * plane + p];
+            }
+            y[oc * plane + p] = activate(acc + b, act, act_p);
+        }
+    }
+}
+
+/// The activation the fused convolutions apply, in the toolkit's convention.
+fn activate(v: f32, act: u32, act_p: f32) -> f32 {
+    match act {
+        1 => {
+            if v > 0.0 {
+                v
+            } else {
+                0.0
+            }
+        }
+        2 => {
+            if v >= 0.0 {
+                v
+            } else {
+                act_p * v
+            }
+        }
+        _ => v,
+    }
+}
+
 /// The reduction `lg_layer_norm_warp` performs: a halving tree over the lane
 /// stride, summed in the order the shuffles do it, then broadcast from lane 0.
 /// The twin reproduces the TREE rather than a serial sum, because that is what
@@ -828,6 +918,142 @@ pub fn selftest() -> Result<(), String> {
         }
         if y1 != y2 {
             return Err("conv1x1_rb disagrees with its own order".into());
+        }
+
+        // lg_conv3x3_tile / lg_conv1x1_tile. Their order is NOT the order of
+        // lg_conv3x3s1p1 / lg_conv1x1 (channel loop outermost, bias after the
+        // sum), so each is checked against a reference in ITS OWN order, and that
+        // order is then compared to the section-6 one to pin the size of the
+        // difference the kernel's comment claims: rounding, not a tap mistake. A
+        // transposed weight or a shifted tap shows up at ~1, four orders above
+        // the 1e-5 bound here.
+        {
+            let (ci, co, h, wd) = (5usize, 4usize, 6usize, 7usize);
+            let plane = h * wd;
+            let x: Vec<f32> = (0..ci * plane).map(|i| ((i * 31 % 89) as f32 - 44.0) / 8.0).collect();
+            let w: Vec<f32> = (0..co * ci * 9).map(|i| ((i * 19 % 53) as f32 - 26.0) / 8.0).collect();
+            let b: Vec<f32> = (0..co).map(|i| (i as f32) / 4.0 - 1.0).collect();
+            let mut y1 = vec![0.0f32; co * plane];
+            conv3x3_tile(&x, &w, &b, &mut y1, ci, co, h, wd, 0, 0.0);
+            // the same sum, one output element at a time, ci then ky then kx
+            let mut y2 = vec![0.0f32; co * plane];
+            for oc in 0..co {
+                for oy in 0..h {
+                    for ox in 0..wd {
+                        let mut acc = 0.0f32;
+                        for ci_ in 0..ci {
+                            for ky in 0..3usize {
+                                for kx in 0..3usize {
+                                    if oy + ky >= 1 && oy + ky <= h && ox + kx >= 1 && ox + kx <= wd {
+                                        acc += x[ci_ * plane + (oy + ky - 1) * wd + (ox + kx - 1)]
+                                            * w[((oc * ci + ci_) * 3 + ky) * 3 + kx];
+                                    }
+                                }
+                            }
+                        }
+                        y2[(oc * h + oy) * wd + ox] = acc + b[oc];
+                    }
+                }
+            }
+            if y1 != y2 {
+                return Err("conv3x3_tile disagrees with its own order".into());
+            }
+            // The section-6 order (ky, kx, ci, bias first) on the same input: the
+            // two orders must agree to rounding and nothing more.
+            let mut worst = 0.0f32;
+            for oc in 0..co {
+                for oy in 0..h {
+                    for ox in 0..wd {
+                        let mut acc = b[oc];
+                        for ky in 0..3usize {
+                            for kx in 0..3usize {
+                                if oy + ky >= 1 && oy + ky <= h && ox + kx >= 1 && ox + kx <= wd {
+                                    for ci_ in 0..ci {
+                                        acc += w[((oc * ci + ci_) * 3 + ky) * 3 + kx]
+                                            * x[ci_ * plane + (oy + ky - 1) * wd + (ox + kx - 1)];
+                                    }
+                                }
+                            }
+                        }
+                        let d = (acc - y1[(oc * h + oy) * wd + ox]).abs();
+                        if d > worst {
+                            worst = d;
+                        }
+                    }
+                }
+            }
+            if worst > 1e-5 {
+                return Err(format!(
+                    "conv3x3_tile differs from the section-6 order by {worst}, expected rounding"
+                ));
+            }
+
+            // The fused activation, in the convention lg_conv3x3_winograd states:
+            // act 2 must scale the negative side by act_p and leave the positive
+            // side alone, which a `0`-vs-`>=0` slip at the origin would survive
+            // but a flipped comparison would not.
+            let slope = 0.1f32;
+            let mut ya = vec![0.0f32; co * plane];
+            conv3x3_tile(&x, &w, &b, &mut ya, ci, co, h, wd, 2, slope);
+            for i in 0..co * plane {
+                let want = if y1[i] >= 0.0 { y1[i] } else { slope * y1[i] };
+                if (ya[i] - want).abs() > 1e-6 {
+                    return Err(format!("conv3x3_tile act=2 at {i}: {} != {}", ya[i], want));
+                }
+            }
+            let mut yr = vec![0.0f32; co * plane];
+            conv3x3_tile(&x, &w, &b, &mut yr, ci, co, h, wd, 1, slope);
+            for i in 0..co * plane {
+                let want = if y1[i] > 0.0 { y1[i] } else { 0.0 };
+                if yr[i] != want {
+                    return Err(format!("conv3x3_tile act=1 at {i}: {} != {}", yr[i], want));
+                }
+            }
+
+            // lg_conv1x1_tile: c ascending with the bias after the sum, against
+            // the section-6 order (bias first) - equal to rounding, and the
+            // biased-and-unbiased pair must differ by exactly the bias.
+            let (ci, co, h, wd) = (6usize, 5usize, 3usize, 4usize);
+            let plane = h * wd;
+            let x: Vec<f32> = (0..ci * plane).map(|i| ((i * 23 % 79) as f32 - 39.0) / 8.0).collect();
+            let w: Vec<f32> = (0..co * ci).map(|i| ((i * 13 % 41) as f32 - 20.0) / 8.0).collect();
+            let b: Vec<f32> = (0..co).map(|i| (i as f32) / 3.0 - 0.5).collect();
+            let mut y1 = vec![0.0f32; co * plane];
+            conv1x1_tile(&x, &w, &b, &mut y1, ci, co, h, wd, 0, 0.0);
+            let mut y2 = vec![0.0f32; co * plane];
+            let mut y0 = vec![0.0f32; co * plane];
+            for o in 0..co {
+                for p in 0..plane {
+                    let mut acc = 0.0f32;
+                    for c in 0..ci {
+                        acc += w[o * ci + c] * x[c * plane + p];
+                    }
+                    y2[o * plane + p] = acc + b[o];
+                    y0[o * plane + p] = acc;
+                }
+            }
+            if y1 != y2 {
+                return Err("conv1x1_tile disagrees with its own order".into());
+            }
+            for i in 0..co * plane {
+                if (y1[i] - y0[i] - b[i / plane]).abs() > 1e-6 {
+                    return Err(format!("conv1x1_tile bias at {i} is not added once"));
+                }
+            }
+            let mut y3 = vec![0.0f32; co * plane];
+            conv1x1_rb(&x, &w, &b, &mut y3, ci, co, h, wd);
+            let mut worst = 0.0f32;
+            for i in 0..co * plane {
+                let d = (y1[i] - y3[i]).abs();
+                if d > worst {
+                    worst = d;
+                }
+            }
+            if worst > 1e-5 {
+                return Err(format!(
+                    "conv1x1_tile differs from conv1x1_rb's order by {worst}, expected rounding"
+                ));
+            }
         }
 
         // lg_layer_norm_warp: a constant row normalizes to (w - b), at widths on

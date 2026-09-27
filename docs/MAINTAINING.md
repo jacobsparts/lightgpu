@@ -72,11 +72,20 @@ Two practical notes from doing this. Do NOT replace an existing op in place when
 the new one needs a different BLOCK SHAPE: a register-blocked GEMM needs
 `block = (16,16,1)` with the grid derived from its tile, while every caller of
 `lg_linear` has `(16,16,1)` hard-coded with a grid of its own, so the promoted
-kernel needs its own name. And a promoted kernel reaches the `path`-dependent
-engines (`scunet-rs`, `swin2sr-rs`) as soon as it compiles, but the `git`-dependent
-ones only after this repository is committed, pushed and their lockfiles
-refreshed - so a consumer's build failing at its `known_kernel` assertion is the
-normal first symptom, not a mistake in the consumer.
+kernel needs its own name.
+
+The second note is about WHEN a promotion reaches anybody, and every consumer in
+this family is in the same case: each declares `lightgpu` as a `git` dependency
+AND pins a revision in its own `Cargo.lock`, and nothing here uses `[patch]` or
+`[replace]`. A kernel added here therefore reaches NO consumer until that
+consumer's lockfile is refreshed - a promotion is invisible to every engine until
+somebody chooses to opt in, which is what makes promoting into a live toolkit
+safe. (An earlier version of this note split the engines into `path`-dependent
+and `git`-dependent, some arriving "as soon as it compiles"; there are no
+`path`-dependent consumers left.) When a consumer DOES refresh, a build failing
+at its `known_kernel` assertion is the normal first symptom of a name that moved,
+not a mistake in the consumer. Commit and push here first: a consumer cannot see
+an unpushed commit, whichever way its lockfile is refreshed.
 
 Consumer-specific kernels can be compiled alongside toolkit kernels with
 `lightgpu_build::fatbin_modules`, using one fatbin/module per source file. This
