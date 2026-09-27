@@ -41,10 +41,13 @@ and are always compiled.
 
 ## What is in the kernel set
 
-48 kernels - the generic ops engines share, plus the machinery to prove
+55 kernels - the generic ops engines share, plus the machinery to prove
 them. Each consumer compiles only the subset it calls:
 
-* **norms** - `rms_norm`, `layer_norm` (one-pass E[x^2]-mean^2 by default, two-pass available), `channel_layer_norm`
+* **norms** - `rms_norm`, `layer_norm` (one-pass E[x^2]-mean^2 by default,
+  `layer_norm_2pass` available), `layer_norm_warp` (one warp a row, the row in
+  registers - an addition, better for narrow rows and slower for wide ones),
+  `channel_layer_norm`
 * **NCHW channel ops** - `channel_affine` (the folded-BatchNorm op, with `null`
   scale or shift and `in` allowed to alias `out`), `channel_scale` (its
   `shift = null` specialisation, for when the per-channel vector is an
@@ -59,16 +62,20 @@ them. Each consumer compiles only the subset it calls:
   what it is)
 * **convolutions** - `conv1x1`, `conv3x3s1p1`, `conv3x3_winograd`
   (F(4x4,3x3), the same op at 4/9ths the multiplies), `conv4x4s4`, `conv_kxk`,
-  `linear_1x1`
+  `linear_1x1`, and the stride-2 pair `conv2x2s2` (plane layout) /
+  `conv_t2x2` (token layout)
 * **vision I/O and layout** - `upsample2x_nearest` (the integer-halving form),
   `pixel_unshuffle2` (space-to-depth with PyTorch's channel order), `lrelu`
   (slope as an argument), `add_scaled` (`a + s*b`, the fused residual)
 * **layouts** - `extract_rows`, `merge_2x2`, `get_row_q8_0_aligned`, `copy_row`,
-  `set_i32`
+  `set_i32`, and the Swin window permutation `window_gather` /
+  `window_scatter` (the cyclic shift as a modulo wrap)
 * **attention** - `attn_gqa` (DRAM K/V, warp per query), `attn_flash`
   (shared-memory staged)
-* **GEMM** - `f32_gemm`, `f32_gemm_tiled`, `quantize_q8_0`, `q8_0_gemm_dp4a`,
-  `q8_0_gemm_aligned`, `q8_0_gemv`
+* **GEMM** - `f32_gemm`, `f32_gemm_tiled`, `linear_rb` / `conv1x1_rb` (one
+  register-blocked body, 4x4 outputs a thread, in the token and plane layouts -
+  a bit-exact replacement for `linear` / `conv1x1`), `quantize_q8_0`,
+  `q8_0_gemm_dp4a`, `q8_0_gemm_aligned`, `q8_0_gemv`
 * **Fourier** - `fft2_r2c`, `fft2_c2r` (batched 2-D real transforms, n <= 64,
   unnormalised, half spectrum - the pair a spectral convolution calls; they are
   what lets an engine drop cuFFT)
