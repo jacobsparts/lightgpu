@@ -1193,6 +1193,36 @@ pub fn window_scatter(
     }
 }
 
+/// `lg_pixel_shuffle`: depth-to-space, the INVERSE of the unshuffle above. Input
+/// channel `c*r*r + dy*r + dx` goes to output channel `c` at `(r*y + dy, r*x + dx)`,
+/// which is torch's `pixel_shuffle(x, r)` view `(c, r, r, h, w) -> (c, h, r, w, r)`.
+///
+/// The permutation is the contract, not the shape, so this is written from the
+/// kernel's stated contract rather than from the kernel's code - the two can
+/// disagree, and `selftest` demands equality between them rather than a tolerance.
+/// One output row `(ch, oy)` is filled per iteration and the rows are independent,
+/// so the loop is parallel; nothing is reordered, so the result is exact.
+pub fn pixel_shuffle(src: &[f32], dst: &mut [f32], c: usize, h: usize, w: usize, r: usize) {
+    let oh = h * r;
+    let ow = w * r;
+    debug_assert_eq!(src.len(), c * r * r * h * w);
+    debug_assert_eq!(dst.len(), c * oh * ow);
+    dst.par_chunks_mut(ow)
+        .enumerate()
+        .for_each(|(row, out_row)| {
+            let ch = row / oh;
+            let oy = row % oh;
+            let y = oy / r;
+            let dy = oy % r;
+            for ox in 0..ow {
+                let x = ox / r;
+                let dx = ox % r;
+                let sch = ch * r * r + dy * r + dx;
+                out_row[ox] = src[(sch * h + y) * w + x];
+            }
+        });
+}
+
 /// Bit reversal of `i` over `nb` bits, matching the kernels' `fft_bitrev`.
 fn bitrev(i: usize, nb: usize) -> usize {
     let mut j = 0usize;
@@ -1947,6 +1977,46 @@ pub fn selftest() -> Result<(), String> {
             window_gather(&x, &mut tok2, nw, win * win, nww, win, hp, wp, c, shift, 0);
             if tok2 != tok {
                 return Err("window_gather is not reproducible at w0 = 0".into());
+            }
+        }
+
+        // lg_pixel_shuffle against an INDEPENDENT reference: the flat
+        // `(c, r, r, h, w) -> (c, h, r, w, r)` view torch's pixel_shuffle is.
+        // Written as index arithmetic rather than as a call to the twin, so a
+        // wrong permutation fails and not merely a wrong shape. Odd sizes are
+        // deliberate: the kernel's r == 2 and r == 3 paths are special-cased and
+        // its 2-D grid has tail guards, and both are only exercised off-tile.
+        for &(c, h, w, r) in &[
+            (3usize, 5usize, 7usize, 2usize),
+            (1, 1, 1, 2),
+            (1, 1, 1, 3),
+            (2, 3, 4, 3),
+            (4, 2, 3, 4),
+            (3, 8, 6, 2),
+        ] {
+            let n_in = c * r * r * h * w;
+            let n_out = c * h * r * w * r;
+            let x: Vec<f32> = (0..n_in).map(|i| i as f32).collect();
+            let mut got = vec![0.0f32; n_out];
+            pixel_shuffle(&x, &mut got, c, h, w, r);
+            for ch in 0..c {
+                for y in 0..h {
+                    for x_ in 0..w {
+                        for dy in 0..r {
+                            for dx in 0..r {
+                                let si = ((ch * r + dy) * r + dx) * h * w + y * w + x_;
+                                let di = (ch * (h * r) + (y * r + dy)) * (w * r) + (x_ * r + dx);
+                                if got[di] != x[si] {
+                                    return Err(format!(
+                                        "pixel_shuffle(c={c},h={h},w={w},r={r}) at out[{di}] = {}, \
+                                         expected in[{si}] = {}",
+                                        got[di], x[si]
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

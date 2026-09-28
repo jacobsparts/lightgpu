@@ -1611,6 +1611,55 @@ extern "C" __global__ void lg_pixel_unshuffle2(
     }
 }
 
+// Depth-to-space: `pixel_shuffle(x, r)` from [r*r*C][H][W] to [C][r*H][r*W],
+// with output channel c at (r*y+dy, r*x+dx) taken from input channel
+// c*r*r + dy*r + dx at (y, x). THE PERMUTATION IS THE CONTRACT, not the shape
+// (as for the unshuffle above): a checkpoint's following conv is ordered by it,
+// so a different channel order produces a different and wrong model.
+//
+// Three engines in this family wrote this op out privately - nafnet-rs and
+// swin2sr-rs at r = 2, hat-rs parametric because HAT ships x3 as well as x4 -
+// and swin2sr-rs's GPU REFUSED a scale-3 head for want of a general kernel while
+// its CPU had one.
+//
+// `r` is a RUNTIME argument: hat-rs launches r = 2 (the two x4 octaves) and
+// r = 3 (its x3 head) from one place. That is why the r == 2 and r == 3 cases
+// are written out separately, and the reason is measured rather than stylistic:
+// at the same grid, the generic `oy / r` form is 6-8% SLOWER than nafnet's
+// fixed-2 kernel at r == 2 (0.0399 ms against 0.0369 ms on an sm_61 card), so
+// the shift path is what keeps this at least as fast as the copy it replaces;
+// and r == 3 needs a literal divisor so the compiler emits a magic multiply
+// instead of a runtime division. Any other r takes the generic form, which is
+// exact but not tuned. Measured against every copy it replaces, at each
+// engine's own geometry, interleaved in one process: r == 2 TIES nafnet's
+// kernel exactly (0.0369 ms at [64][64][64]) and is 1.9-2.1x hat-rs's flat-grid
+// form; r == 3 is 1.88x hat-rs's (0.0799 against 0.1505 ms).
+//
+// grid = (ceil(r*w/32), ceil(r*h/8), c), block = (32, 8, 1). One thread per
+// output element with the channel in blockIdx.z, which is where the speed comes
+// from: the two divisions by the runtime output width and height disappear, and
+// a warp's four-element group stays inside one input row.
+extern "C" __global__ void lg_pixel_shuffle(
+    const float *__restrict__ src, float *__restrict__ dst,
+    int c, int h, int w, int r)
+{
+    const int oh = h * r, ow = w * r;
+    const int ch = blockIdx.z;
+    const int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const int ox = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c || oy >= oh || ox >= ow) return;
+    int y, x, dy, dx;
+    if (r == 2) {
+        y = oy >> 1; x = ox >> 1; dy = oy & 1; dx = ox & 1;
+    } else if (r == 3) {
+        y = oy / 3; x = ox / 3; dy = oy - y * 3; dx = ox - x * 3;
+    } else {
+        y = oy / r; x = ox / r; dy = oy - y * r; dx = ox - x * r;
+    }
+    const int sch = ch * r * r + dy * r + dx;
+    dst[((size_t)ch * oh + oy) * ow + ox] = src[((size_t)sch * h + y) * w + x];
+}
+
 // Device-side image marshalling is deliberately NOT here: at 4K the host-side
 // interleaved-RGB/planar-NCHW conversion is negligible against the forward pass,
 // so such kernels would add an unexercised code path for no gain.
