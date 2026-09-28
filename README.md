@@ -1,16 +1,20 @@
 # lightgpu
 
 The toolkit behind the lightgpu inference engines:
-[nafnet-rs](https://github.com/jacobsparts/nafnet-rs),
-[rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
-[maxim-rs](https://github.com/jacobsparts/maxim-rs),
-[scunet-rs](https://github.com/jacobsparts/scunet-rs),
-[swin2sr-rs](https://github.com/jacobsparts/swin2sr-rs),
-[ifan-rs](https://github.com/jacobsparts/ifan-rs),
-[realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs),
-[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs),
-[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs) and
-[nightenh-rs](https://github.com/jacobsparts/nightenh-rs).
+
+| engine | what it does |
+| --- | --- |
+| [realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs) | Real-ESRGAN (RRDBNet) image upscaling, x2 and x4 |
+| [swin2sr-rs](https://github.com/jacobsparts/swin2sr-rs) | Swin2SR image super-resolution, classical / real-world / lightweight / compressed |
+| [nafnet-rs](https://github.com/jacobsparts/nafnet-rs) | NAFNet motion deblurring (GoPro, REDS) and denoising (SIDD) |
+| [maxim-rs](https://github.com/jacobsparts/maxim-rs) | MAXIM low-light enhancement, denoising, deblurring, deraining, dehazing |
+| [scunet-rs](https://github.com/jacobsparts/scunet-rs) | SCUNet real-world image denoising |
+| [ifan-rs](https://github.com/jacobsparts/ifan-rs) | IFAN defocus deblurring |
+| [nightenh-rs](https://github.com/jacobsparts/nightenh-rs) | night-photography enhancement (low light) and light-effects suppression |
+| [lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs) | big-LaMa inpainting of objects, damage or watermarks |
+| [rmbg-rs](https://github.com/jacobsparts/rmbg-rs) | RMBG-2.0 (BiRefNet) background removal |
+| [locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs) | NVIDIA LocateAnything-3B open-vocabulary object detection |
+
 [adaptive-enhance](https://github.com/jacobsparts/adaptive-enhance) is a CPU-only
 toolset that does not use it.
 [pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for cleaning up
