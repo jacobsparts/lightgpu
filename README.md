@@ -7,6 +7,7 @@ The toolkit behind the lightgpu family:
 | [pixeldeck](https://github.com/jacobsparts/pixeldeck) | a local web app for cleaning up product photos; drives all of the engines below, and the reason the family exists |
 | [realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs) | Real-ESRGAN (RRDBNet) image upscaling, x2 and x4 |
 | [swin2sr-rs](https://github.com/jacobsparts/swin2sr-rs) | Swin2SR image super-resolution, classical / real-world / lightweight / compressed |
+| [hat-rs](https://github.com/jacobsparts/hat-rs) | HAT (Hybrid Attention Transformer) image super-resolution, S/M/L at x2/x3/x4 |
 | [nafnet-rs](https://github.com/jacobsparts/nafnet-rs) | NAFNet motion deblurring (GoPro, REDS) and denoising (SIDD) |
 | [maxim-rs](https://github.com/jacobsparts/maxim-rs) | MAXIM low-light enhancement, denoising, deblurring, deraining, dehazing |
 | [scunet-rs](https://github.com/jacobsparts/scunet-rs) | SCUNet real-world image denoising |
