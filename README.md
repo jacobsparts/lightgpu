@@ -177,20 +177,6 @@ a.launch(&m, "lg_rms_norm", lightgpu::vm::Launch::new((nrows as u32, 1, 1), (256
 lightgpu::vm::sync()?;
 ```
 
-## Credits
-
-The kernel set merges work from six engines: LocateAnything-3B (MoonViT +
-Qwen2 - transformer kernels and the q8_0 path), RMBG-2.0 (BiRefNet - vision
-kernels), Real-ESRGAN (RRDBNet - the F(4x4,3x3) Winograd convolution and the
-vision I/O ops), lama-inpaint-rs (big-lama - the batched 2-D Fourier
-transforms, which replaced its own in-tree FFT so that no engine needs cuFFT),
-maxim-rs (MAXIM-2S Enhancement/LOL - the NCHW per-channel affine and global
-average pool, plus the plain ReLU/`shift = null` scale contracts their ops
-turned out to share) and scunet-rs (SCUNet - the register-blocked 1x1
-convolution and token linear, measured over the seven stage geometries that
-engine runs, and the Swin window pair it shares with rmbg-rs).
-Model weights are not included: this crate is only the toolkit.
-
 ## Embedding only the kernels you call
 
 A binary should carry the kernels it uses, not every kernel the toolkit defines.
