@@ -1,9 +1,10 @@
 # lightgpu
 
-The toolkit behind the lightgpu inference engines:
+The toolkit behind the lightgpu family:
 
-| engine | what it does |
+| member | what it does |
 | --- | --- |
+| [pixeldeck](https://github.com/jacobsparts/pixeldeck) | a local web app for cleaning up product photos; drives all of the engines below, and the reason the family exists |
 | [realesrgan-rs](https://github.com/jacobsparts/realesrgan-rs) | Real-ESRGAN (RRDBNet) image upscaling, x2 and x4 |
 | [swin2sr-rs](https://github.com/jacobsparts/swin2sr-rs) | Swin2SR image super-resolution, classical / real-world / lightweight / compressed |
 | [nafnet-rs](https://github.com/jacobsparts/nafnet-rs) | NAFNet motion deblurring (GoPro, REDS) and denoising (SIDD) |
@@ -14,11 +15,11 @@ The toolkit behind the lightgpu inference engines:
 | [lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs) | big-LaMa inpainting of objects, damage or watermarks |
 | [rmbg-rs](https://github.com/jacobsparts/rmbg-rs) | RMBG-2.0 (BiRefNet) background removal |
 | [locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs) | NVIDIA LocateAnything-3B open-vocabulary object detection |
+| [adaptive-enhance](https://github.com/jacobsparts/adaptive-enhance) | a CPU-only toolset for adaptive contrast and tone; does not use this toolkit |
 
-[adaptive-enhance](https://github.com/jacobsparts/adaptive-enhance) is a CPU-only
-toolset that does not use it.
-[pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for cleaning up
-product photos that drives all of these engines.
+pixeldeck is the family's reason for being; everything else in the table is an
+engine it drives (or, in adaptive-enhance's case, a companion toolset it sits
+alongside).
 
 A dependency-light CUDA toolkit for building small inference engines without
 reimplementing the plumbing each time: the driver layer, the kernel set, and the
