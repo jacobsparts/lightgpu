@@ -1002,6 +1002,65 @@ pub fn conv3x3_tile(
     }
 }
 
+/// `lg_conv3x3_q2` / `lg_conv3x3_q2ng2` / `lg_conv3x3_catq0` /
+/// `lg_conv3x3_catq0ng2` - the parameterised tile body's CONCATENATED-INPUT form.
+///
+/// `cats` is the input as the kernel sees it: each entry is one source plane and
+/// its channel count, read in order, and their channel counts sum to the
+/// concatenated `c_in` the caller passes to the kernel. The kernel takes the same
+/// virtual plane as `in` plus `i1..i5` with the channel START of each (`g1..g5}`);
+/// those starts are the running sums of the counts here.
+///
+/// THE ORDER IS `conv3x3_tile`'s: ci outermost, then ky, then kx, and THE BIAS IS
+/// ADDED AFTER THE SUM. NG is a launch geometry and does not change a single
+/// addition, so this one twin covers all four entry points - and at NG == 1 the
+/// entries are the same accumulation as `lg_conv3x3_tile`, which is what
+/// `selftest` demands equality against.
+pub fn conv3x3_body(
+    cats: &[(&[f32], usize)],
+    w: &[f32], bias: &[f32], y: &mut [f32],
+    c_out: usize, h: usize, wd: usize, act: u32, act_p: f32,
+) {
+    let plane = h * wd;
+    let c_in: usize = cats.iter().map(|(_, c)| *c).sum();
+    // The concatenated channel index -> (source plane, channel within it) map,
+    // built once so the inner loops carry no search.
+    let mut at: Vec<(usize, usize)> = Vec::with_capacity(c_in);
+    for (i, (_, c)) in cats.iter().enumerate() {
+        for k in 0..*c {
+            at.push((i, k));
+        }
+    }
+    for oc in 0..c_out {
+        let b = if bias.is_empty() { 0.0f32 } else { bias[oc] };
+        for oy in 0..h {
+            for ox in 0..wd {
+                let mut acc = 0.0f32;
+                for ci in 0..c_in {
+                    let (sp, local) = at[ci];
+                    let s = cats[sp].0;
+                    let wp = (oc * c_in + ci) * 9;
+                    for ky in 0..3 {
+                        let iy = oy as isize + ky as isize - 1;
+                        if iy < 0 || iy >= h as isize {
+                            continue;
+                        }
+                        for kx in 0..3 {
+                            let ix = ox as isize + kx as isize - 1;
+                            if ix < 0 || ix >= wd as isize {
+                                continue;
+                            }
+                            acc += s[local * plane + iy as usize * wd + ix as usize]
+                                * w[wp + ky * 3 + kx];
+                        }
+                    }
+                }
+                y[(oc * h + oy) * wd + ox] = activate(acc + b, act, act_p);
+            }
+        }
+    }
+}
+
 /// `lg_conv1x1_tile`: the same operator as `lg_conv1x1`, accumulated in the
 /// tiled kernel's order - c ascending, and the BIAS ADDED AFTER THE SUM where
 /// `lg_conv1x1` and `lg_conv1x1_rb` both fold it in first. That single
@@ -1803,6 +1862,74 @@ pub fn selftest() -> Result<(), String> {
                 }
             }
 
+            // lg_conv3x3_q2 / _q2ng2 / _catq0 / _catq0ng2 - the promoted tile
+            // body. SPLIT INTO PLANES it must equal the single-plane twin
+            // BIT FOR BIT: the concatenation only changes WHERE a channel value
+            // is read from, so a difference here is an indexing mistake in the
+            // split, not rounding. And ONE PLANE must equal conv3x3_tile, which
+            // the OPS table already claims is the same accumulation - equality
+            // rather than a tolerance, because the two are the same order.
+            {
+                let slope = 0.1f32;
+                let (ci, co, h, wd) = (6usize, 5usize, 4usize, 5usize);
+                let plane = h * wd;
+                let x: Vec<f32> =
+                    (0..ci * plane).map(|i| ((i * 29 % 83) as f32 - 41.0) / 8.0).collect();
+                let w: Vec<f32> = (0..co * ci * 9).map(|i| ((i * 17 % 61) as f32 - 30.0) / 8.0).collect();
+                let b: Vec<f32> = (0..co).map(|i| (i as f32) / 4.0 - 0.5).collect();
+
+                // one plane, the whole input
+                let mut want = vec![0.0f32; co * plane];
+                conv3x3_body(&[(&x, ci)], &w, &b, &mut want, co, h, wd, 2, slope);
+                let mut have = vec![0.0f32; co * plane];
+                conv3x3_tile(&x, &w, &b, &mut have, ci, co, h, wd, 2, slope);
+                if want != have {
+                    return Err("conv3x3_body(1 plane) != conv3x3_tile".into());
+                }
+
+                // The same input, with the channels CONCATENATED IN A DIFFERENT
+                // ORDER - which is what actually exercises the plane list, since
+                // a concatenation in the original order would reproduce the
+                // identity map and test nothing. `order` is the ORIGINAL channel
+                // index at each position of the concatenation; `cuts` are the
+                // plane boundaries in that order, so a caller's weight panel has
+                // to be permuted the same way.
+                let order = [4usize, 5, 0, 1, 2, 3];
+                let cuts = [0usize, 2, 4, 6];
+                let mut parts: Vec<Vec<f32>> = Vec::new();
+                for wnd in cuts.windows(2) {
+                    let (a, b) = (wnd[0], wnd[1]);
+                    let mut p = vec![0.0f32; (b - a) * plane];
+                    for (j, &orig) in order[a..b].iter().enumerate() {
+                        for q in 0..plane {
+                            p[j * plane + q] = x[orig * plane + q];
+                        }
+                    }
+                    parts.push(p);
+                }
+                let mut lut = [0usize; 6];
+                for (pos, &orig) in order.iter().enumerate() {
+                    lut[orig] = pos;
+                }
+                let mut wsplit = vec![0.0f32; w.len()];
+                for oc in 0..co {
+                    for ci_ in 0..ci {
+                        for t in 0..9 {
+                            wsplit[(oc * ci + lut[ci_]) * 9 + t] = w[(oc * ci + ci_) * 9 + t];
+                        }
+                    }
+                }
+                let refs: Vec<(&[f32], usize)> = parts
+                    .iter()
+                    .zip(cuts.windows(2))
+                    .map(|(p, wnd)| (p.as_slice(), wnd[1] - wnd[0]))
+                    .collect();
+                let mut got = vec![0.0f32; co * plane];
+                conv3x3_body(&refs, &wsplit, &b, &mut got, co, h, wd, 2, slope);
+                if got != want {
+                    return Err("conv3x3_body(3 planes) != the single-plane result".into());
+                }
+            }
             // lg_conv1x1_tile: c ascending with the bias after the sum, against
             // the section-6 order (bias first) - equal to rounding, and the
             // biased-and-unbiased pair must differ by exactly the bias.

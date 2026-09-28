@@ -74,18 +74,43 @@ the new one needs a different BLOCK SHAPE: a register-blocked GEMM needs
 `lg_linear` has `(16,16,1)` hard-coded with a grid of its own, so the promoted
 kernel needs its own name.
 
-The second note is about WHEN a promotion reaches anybody, and every consumer in
-this family is in the same case: each declares `lightgpu` as a `git` dependency
-AND pins a revision in its own `Cargo.lock`, and nothing here uses `[patch]` or
-`[replace]`. A kernel added here therefore reaches NO consumer until that
-consumer's lockfile is refreshed - a promotion is invisible to every engine until
-somebody chooses to opt in, which is what makes promoting into a live toolkit
-safe. (An earlier version of this note split the engines into `path`-dependent
-and `git`-dependent, some arriving "as soon as it compiles"; there are no
-`path`-dependent consumers left.) When a consumer DOES refresh, a build failing
-at its `known_kernel` assertion is the normal first symptom of a name that moved,
-not a mistake in the consumer. Commit and push here first: a consumer cannot see
-an unpushed commit, whichever way its lockfile is refreshed.
+A third, for a promoted TEMPLATE, learned promoting hcflow-rs's parameterised tile
+body: PUBLISH IT AS NAMED INSTANTIATIONS, not as the template alone. nvcc emits no
+global for a template that nothing instantiates, and each consumer compiles its own
+`kernels.cu` into its own fatbin and prunes it with `--entries` - so a consumer
+cannot instantiate a toolkit template even though it can read the source, and a
+promotion that stops at the template is unreachable from every engine in the family.
+The named `__global__` wrappers ARE the contract (`lg_conv3x3_q2`, `_q2ng2`,
+`_catq0`, `_catq0ng2`), and they are also the only place the launch geometry can be
+written down, since a template argument is invisible to a consumer that reads
+`OPS`. Promote the wrapper for every configuration an engine actually DISPATCHES,
+not every configuration its dev sweep measured: the sweep is what the engine's own
+`--conv-bench` is for.
+
+The second note is about WHEN a promotion reaches anybody, and it differs by
+engine. Every consumer but one declares `lightgpu` as a `git` dependency AND pins
+a revision in its own `Cargo.lock`, and nothing here uses `[patch]` or `[replace]`.
+A kernel added here therefore reaches those engines only when their lockfile is
+refreshed - a promotion is invisible to them until somebody chooses to opt in,
+which is what makes promoting into a live toolkit safe. When such a consumer DOES
+refresh, a build failing at its `known_kernel` assertion is the normal first
+symptom of a name that moved, not a mistake in the consumer. Commit and push here
+first: a git-dependent consumer cannot see an unpushed commit.
+
+THE ONE EXCEPTION is `hcflow-rs`, which declares `lightgpu = { path = "../lightgpu" }`
+and so is the engine a promotion reaches IMMEDIATELY, on its next build. (It is
+path-dependent because it is the one project in the family that is not a git
+repository and therefore has nothing to pin a revision against.) Nothing about
+the promotion process changes for it - the copy, the accumulation order, the twin,
+the `gpuinfo` run and the A/B are all the same - but the A/B CANNOT be run from the
+toolkit's copy alone: there is no environment switch to hold the old kernel
+behind, so the other arm of the measurement has to be a previously built BINARY.
+That is a strictly better arm than a switch anyway, since it also proves the
+toolkit's copy is byte-for-byte what the project's copy used to produce: point the
+old binary and the new one at the same input, and `cmp` the outputs. That is the
+sequence a promotion into a path-dependent consumer is finished by, and it is the
+only way to license DELETING the project's copy rather than leaving it behind a
+switch.
 
 Consumer-specific kernels can be compiled alongside toolkit kernels with
 `lightgpu_build::fatbin_modules`, using one fatbin/module per source file. This

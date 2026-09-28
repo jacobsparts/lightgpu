@@ -2573,3 +2573,370 @@ extern "C" __global__ void lg_window_scatter(
     lg_window_index(w0 + wl, t, nww, win, hp, wp, shift, &y, &xx);
     x[(size_t)ch * ((size_t)hp * wp) + (size_t)y * wp + xx] = tok[(size_t)(wl * n + t) * c + ch];
 }
+
+// ---------------------------------------------------------------------------
+// The PARAMETERISED TILE BODY: lg_conv3x3_q2 / _q2ng2 / _catq0 / _catq0ng2
+// ---------------------------------------------------------------------------
+//
+// 3x3, stride 1, pad 1 - the SAME op family as `lg_conv3x3_tile`, promoted from
+// hcflow-rs where it was written, measured and left. WHAT IT ADDS OVER
+// `lg_conv3x3_tile` IS THREE THINGS, and the first is why it is a second entry
+// point rather than a replacement:
+//
+//   1. THE TILE SHAPE IS A TEMPLATE PARAMETER. `lg_conv3x3_tile` is fixed at a
+//      128-column tile (TBX 32 x TPX 4), 8 rows, CI 4 staged input channels and
+//      OC 8 output channels per thread; this body takes all of them (TBX, TBY,
+//      TPX, OCM, CIM) so a caller can retile for its own shapes without a second
+//      copy of the algorithm. `lg_tile_body<32,8,4>` reproduced `lg_conv3x3_tile`'s
+//      geometry exactly on the promoting engine.
+//   2. NG OUTPUT-CHANNEL GROUPS PER BLOCK (default 1). Each group is a separate
+//      CTA elsewhere in the family, so it costs its own copy of the staged input
+//      tile; putting NG groups in one block as a threadIdx.z axis makes them
+//      share one. It does not hide the staging latency, it amortizes it: only the
+//      accumulator init, the weight fetch and the epilogue become NG-way and
+//      `acc[OC][TPX]` per thread is unchanged. Measured 1.17-1.58x over NG=1 on
+//      the promoting engine's shapes, which is why the NG=2 entries below exist.
+//      THE BLOCK SHAPE DIFFERS (block = (TBX, TBY, NG)), so this is a separate
+//      name and not a flag on `lg_conv3x3_tile`.
+//   3. UP TO FIVE CONCATENATED SOURCE PLANES. `i1..i5` are extra input planes and
+//      `g1..g5` the channel index at which each BEGINS, so the conv reads a
+//      virtual plane whose channels are the concatenation. A dense block grows its
+//      input by one plane per layer, and materialising that concatenation would be
+//      a copy of the whole activation per layer; these folds it into the read.
+//      With `ng <= 1` the body is a single plane and this is inert.
+//
+// THE ACCUMULATION ORDER IS (ci, ky, kx) WITH THE BIAS ADDED AFTER THE SUM,
+// exactly as `lg_conv3x3_tile`, and NOT `lg_conv3x3s1p1`'s (ky, kx, ci) with the
+// bias first. So the NG==1 entries are BIT-IDENTICAL to `lg_conv3x3_tile` at the
+// same geometry (the promoting engine measured equality, not a tolerance), and
+// their CPU twin below demands equality too.
+//
+// THE EXTRA POINTERS ARE AN ABI HAZARD. These entries take FOURTEEN arguments
+// where `lg_conv3x3_tile` takes ten, and a launch that passes the wrong count is a
+// wrong number rather than an error: a caller moving onto them must check the
+// width (see cuda/CONVENTIONS.md on `int` versus `long`).
+//
+template <int TBX, int TBY, int TPX, int OCM = 8, int CIM = 4, int ZFIRST = 1,
+          bool PREZERO = false, int ZSWAP = 0, int NG = 1>
+__device__ __forceinline__ void lg_tile_body(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int wd, int act, float act_p,
+    const float *__restrict__ i1 = nullptr, const float *__restrict__ i2 = nullptr,
+    const float *__restrict__ i3 = nullptr, const float *__restrict__ i4 = nullptr,
+    const float *__restrict__ i5 = nullptr,
+    int g1 = 0, int g2 = 0, int g3 = 0, int g4 = 0, int g5 = 0, int ng = 1)
+{
+    constexpr int TW = TBX * TPX;   // output columns per tile
+    constexpr int TH = TBY;         // output rows per tile
+    constexpr int CI = CIM;         // input channels per staged tile
+    constexpr int OC = OCM;         // output channels per tile, accumulators per thread
+    // Staged width, with the halo, rounded so that the ROW STRIDE does not put
+    // two rows of a warp into the same banks. A warp covers two rows of the
+    // staged tile (TBX = 16 threads to a row), and the row stride is SW floats,
+    // so with SW = TW + 2 = 66 the second row sits 2 banks from the first and
+    // the two 16-wide reads overlap in 14 banks - a two-way conflict on every
+    // input load in the inner loop. A stride of 16 (mod 32) puts them in
+    // complementary halves and removes it entirely. Costs a few hundred bytes
+    // of shared memory per channel tile.
+    constexpr int SW = ((TW + 2) % 32 >= 16) ? (TW + 2)
+                                             : (TW + 2 + 16 - ((TW + 2) % 32));
+    constexpr int SH = TH + 2;      // staged height, with the halo
+
+    __shared__ float sh[CI][SH][SW];
+    // [tap][ci][oc]: the eight `oc` weights of one (tap, ci) are contiguous, so
+    // the inner loop reads them with two 16-byte loads instead of eight scalars.
+    // The NG channel groups of this block sit SIDE BY SIDE along the last index,
+    // group `z` owning [z*OC, z*OC + OC); with NG == 1 that is the original
+    // layout exactly, so the NG == 1 instantiation is unchanged.
+    __shared__ float sw[9][CI][NG * OC];
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * TBX + tx;
+    // `tyz`/`tidz` fold the NG axis into the STAGING thread space: with NG = 2 the
+    // block's 256 threads split the SAME rows between them (stride TBY * NG), so
+    // the staging loop costs the block exactly what it cost at NG = 1 while
+    // feeding NG times the FMAs. Without this the z-slabs would each stage the
+    // whole tile - NG times the global traffic, which is the opposite of the
+    // point. At NG == 1 both reduce to `ty` and `tid`.
+    const int tyz = ty + (NG > 1 ? threadIdx.z : 0) * TBY;
+    const int tidz = tyz * TBX + tx;
+    // WHICH AXIS IS WHICH. CUDA launches blocks with `blockIdx.x` varying
+    // FASTEST, and the blocks that share an input tile are exactly the ones
+    // that differ only in their output-channel group. With the channels on
+    // `z` (the default) those blocks are launched a whole plane apart and each
+    // one re-reads the input from DRAM; with the channels on `x` they run
+    // back to back and the second one's read hits L2. `ZFIRST` selects the
+    // former (the layout this kernel shipped with), `CHANX` the latter.
+    // THE THREE AXIS MAPS, all reachable through the same template.
+    //   ZFIRST = 1                tile column on x, channel group on z (shipped)
+    //   ZFIRST = 0, ZSWAP = 0     channel group on x, tile column on z
+    //   ZFIRST = 0, ZSWAP = 1     BOTH on x: the tile column occupies the HIGH
+    //                             bits of blockIdx.x and the channel group the
+    //                             low ones, so `c_out/OC` consecutive x values
+    //                             are the channel groups of ONE tile column.
+    // The third is the interesting one at small plane sizes, where there are not
+    // enough tiles to fill 20 SMs: it lets a kernel whose tile count is short
+    // still spread its channel groups across the machine instead of running
+    // `c_out/OC` of them per SM back to back. The launch must supply
+    // `(GC * GW, GH, 1)` - see the launch geometry on each named entry below.
+    const int GC_ = (c_out + OC - 1) / OC;
+    const int bx = blockIdx.x;
+    const int ox0 = (ZFIRST ? bx : (ZSWAP ? bx / GC_ : blockIdx.z)) * TW;
+    const int oy0 = blockIdx.y * TH;
+    // NG CHANNEL GROUPS PER BLOCK. Each group is a separate CTA elsewhere in
+    // the family, so it costs its own copy of the STAGED INPUT TILE; putting
+    // several groups in one block makes them share one, and that is the whole
+    // point. The groups are spread over threadIdx.z (the block is
+    // (TBX, TBY, NG)), and since NG does not enter the input tile at all, the
+    // staging loop, its bounds predicates and the re-read are amortized over NG
+    // times the arithmetic.
+    //
+    // WHY THIS AND NOT MORE OC. Raising `OC` cuts the re-read the same way but
+    // costs acc[OC][TPX] and wv[OC] IN EVERY THREAD - `r16x`/`r32a-c` measure
+    // it, and they are 9.0-11.5 ms against the 64-column tile's 6.16 at 64->64@512x512. NG
+    // leaves regs/thread alone: only the acc initialisation, the `wv` fetch and
+    // the epilogue become NG-way, and every thread's accumulator set stays
+    // `acc[OC][TPX]`.
+    //
+    // WHY NOT dbuf/pipe/p1. Those try to HIDE the exposed load latency and all
+    // lost: a second shared buffer is a tie end to end, register prefetch is
+    // -30% (the 64-column tile is at its register cap), deferred stores -22% with a stack frame.
+    // NG does not hide the latency, it AMORTIZES it - the same measurement that
+    // condemns prefetching (72% of the kernel is the global load a shared store
+    // waits on) is what endorses this one.
+    //
+    // MEASURED COST MODEL IT ATTACKS. One call stages GC * c_in * (TH+2)(TW+2) *
+    // 4 bytes of input plus 9 * c_in * c_out * 4 * tiles of weights, the second
+    // term independent of GC. At 64->64@512x512 that is 692.1 + 75.5 = 767.6 MB
+    // for 19.33 GFLOP = 24.0 FLOP per staged byte, and 24.0 x the ~137 GB/s the
+    // kernel actually achieves inside itself is 3288 GFLOP/s against a measured
+    // 3162 - the model reproduces the ceiling, so the ceiling is the staged
+    // traffic. NG=2 gives 43.7, NG=4 74.2 FLOP/byte; reaching the 8938 GFLOP/s
+    // FMA ceiling at NG=1 would need 372 GB/s, above the card's DRAM peak.
+    const int z = NG > 1 ? threadIdx.z : 0;
+    const int oc0 = ((ZFIRST ? blockIdx.z : (ZSWAP ? bx % GC_ : bx)) * NG + z) * OC;
+    const int gx0 = ox0 - 1, gy0 = oy0 - 1;
+
+    float acc[OC][TPX];
+#pragma unroll
+    for (int o = 0; o < OC; ++o)
+#pragma unroll
+        for (int p = 0; p < TPX; ++p) acc[o][p] = 0.0f;
+
+    for (int ci0 = 0; ci0 < c_in; ci0 += CI) {
+        if (PREZERO) {
+            // ONE write of the whole tile, then the staging loop only writes the
+            // elements it actually has a value for. Every element of `sh` is
+            // written exactly once per channel tile either way, so this is the
+            // same instruction count for the tile as a whole with the bounds
+            // predicates moved out of the per-element path - which is the
+            // per-channel-tile overhead the staging probe showed dominates the
+            // kernel (measured on the promoting engine: 8-18% of the time is arithmetic).
+            float *shf = &sh[0][0][0];
+            for (int i = tidz; i < CI * SH * SW; i += TBX * TBY * NG) shf[i] = 0.0f;
+        }
+        // Staged WITHOUT a flat index and therefore without an integer
+        // division: `i / SW` is a multiply-shift sequence per staged element,
+        // and there are CI of them per channel tile. The nested form walks the
+        // rows and columns directly instead.
+#pragma unroll
+        for (int k = 0; k < CI; ++k) {
+            const int ci = ci0 + k;
+            const bool ci_ok = ci < c_in;
+            for (int sy = tyz; sy < SH; sy += TBY * NG) {
+                const int gy = gy0 + sy;
+                const bool y_ok = ci_ok && gy >= 0 && gy < h;
+                // WHICH PLANE this channel lives in, and at what offset within
+                // it. With `ng == 1` the input is a single plane and this
+                // reduces to the original expression. With more, the input is a
+                // CONCATENATION of `ng` planes along the channel axis - the
+                // dense block's growing input `cat([x, h1, h2, ...])` - and the
+                // concatenated channel index is mapped to a (plane, channel
+                // within plane) pair through the group starts. The comparison
+                // chain runs once per staged element, its operand is the channel
+                // loop index so it is uniform across a warp, and the kernel
+                // reads the same bytes the concatenated copy would have held -
+                // it just skips the copy (15 of them per dense block, 11% of the
+                // LR64 run and 12% of the LR256 one).
+                const int ci_u = ci_ok ? ci : 0;
+                int base = 0;
+                const float *plane = in;
+                if (ng > 1 && ci_u >= g1) { base = g1; plane = i1; }
+                if (ng > 2 && ci_u >= g2) { base = g2; plane = i2; }
+                if (ng > 3 && ci_u >= g3) { base = g3; plane = i3; }
+                if (ng > 4 && ci_u >= g4) { base = g4; plane = i4; }
+                if (ng > 5 && ci_u >= g5) { base = g5; plane = i5; }
+                const float *src = plane + ((size_t)(ci_u - base) * h + (gy < 0 ? 0 : gy)) * wd;
+                if (PREZERO) {
+                    // The whole tile was zeroed before this loop, so an element
+                    // that is out of the plane is left holding that zero instead
+                    // of being written with one - and the ROW predicate, which is
+                    // uniform across the warp (every thread of a row shares `gy`),
+                    // becomes a branch around the column loop rather than a test
+                    // inside it. What remains per element is the column check
+                    // alone.
+                    //
+                    // The row branch is also what keeps the halo at zero: rows 0
+                    // and SH-1 are the halo rows and their `gy` is outside the
+                    // plane for a full tile, so they take the branch and keep the
+                    // zeroed value. An element at an IN-PLANE halo row (a tile
+                    // that starts at row 0 has its row 0 halo row also in plane)
+                    // is read back through the column check instead.
+                    if (!ci_ok || gy < 0 || gy >= h) {
+                        // nothing to load; the zeros stay
+                    } else {
+                        for (int sx = tx; sx < SW; sx += TBX) {
+                            const int gx = gx0 + sx;
+                            if (gx >= 0 && gx < wd) sh[k][sy][sx] = src[gx];
+                        }
+                    }
+                } else {
+                    for (int sx = tx; sx < SW; sx += TBX) {
+                        const int gx = gx0 + sx;
+                        float v = 0.0f;
+                        if (y_ok && gx >= 0 && gx < wd) v = src[gx];
+                        sh[k][sy][sx] = v;
+                    }
+                }
+            }
+        }
+        // The staged weight tile covers the NG groups' weights for THIS channel
+        // tile, so its total size is 9 * CI * OC * NG - but each `z` slab owns a
+        // DIFFERENT range of it (`sw[..][..][z*OC + o]`), so the split has to be
+        // PER SLAB and not across the whole block: this loop's range is one
+        // group's 9 * CI * OC entries and its stride is one block's worth of
+        // threads. Splitting it as `tidz .. 9*CI*OC step TBX*TBY*NG` (the shape
+        // the input staging correctly uses, where the staged data IS shared)
+        // leaves the upper z slabs' weights unwritten - which is a WRONG PLANE,
+        // not a slow one, and is exactly how this was first written and caught by
+        // `--ng-test`'s NG=2 correctness row at 1.04e1 relative. The block's
+        // weight-staging work therefore still grows with NG (it must - the tile
+        // is NG times bigger), while the input staging does not (it must not -
+        // the tile is shared).
+        for (int wi = tid; wi < 9 * CI * OC; wi += TBX * TBY) {
+            const int tap = wi / (CI * OC);
+            const int k = (wi / OC) % CI;
+            const int o = wi % OC;
+            const int ci = ci0 + k;
+            const int oc = oc0 + o;
+            float v = 0.0f;
+            if (ci < c_in && oc < c_out) v = w[((size_t)oc * c_in + ci) * 9 + tap];
+            sw[tap][k][z * OC + o] = v;
+        }
+        __syncthreads();
+
+        // Per (ci, tap) the TPX input values are loaded once and reused for
+        // every output channel in the tile; the OC weights are loaded as OC/4
+        // float4s and reused for every pixel. Raising OC raises the reuse of
+        // both, at the cost of accumulators: OC * TPX floats in registers.
+        //
+        // With NG groups in the block, the input tile is SHARED and the weight
+        // slice is not: `z` picks its group's OC weights out of the row, which is
+        // still one contiguous, 16-byte-aligned run so the float4 loads below are
+        // unchanged.
+#pragma unroll
+        for (int k = 0; k < CI; ++k)
+#pragma unroll
+            for (int ky = 0; ky < 3; ++ky)
+#pragma unroll
+                for (int kx = 0; kx < 3; ++kx) {
+                    const int tap = ky * 3 + kx;
+                    float v[TPX];
+#pragma unroll
+                    for (int p = 0; p < TPX; ++p)
+                        v[p] = sh[k][ty + ky][tx + p * TBX + kx];
+                    const float4 *wp =
+                        reinterpret_cast<const float4 *>(&sw[tap][k][z * OC]);
+                    float wv[OC];
+#pragma unroll
+                    for (int o4 = 0; o4 < OC / 4; ++o4) {
+                        const float4 wq = wp[o4];
+                        wv[o4 * 4 + 0] = wq.x;
+                        wv[o4 * 4 + 1] = wq.y;
+                        wv[o4 * 4 + 2] = wq.z;
+                        wv[o4 * 4 + 3] = wq.w;
+                    }
+#pragma unroll
+                    for (int o = 0; o < OC; ++o)
+#pragma unroll
+                        for (int p = 0; p < TPX; ++p) acc[o][p] += wv[o] * v[p];
+                }
+        __syncthreads();
+    }
+
+    const int my = oy0 + ty;
+#pragma unroll
+    for (int o = 0; o < OC; ++o) {
+        const int oc = oc0 + o;
+        if (oc < c_out && my < h) {
+            const float b = bias ? bias[oc] : 0.0f;
+#pragma unroll
+            for (int p = 0; p < TPX; ++p) {
+                const int gx = ox0 + tx + p * TBX;
+                if (gx < wd) {
+                    float v = acc[o][p] + b;
+                    if (act == 1) v = v > 0.0f ? v : 0.0f;
+                    else if (act == 2) v = v >= 0.0f ? v : act_p * v;
+                    out[((size_t)oc * h + my) * wd + gx] = v;
+                }
+            }
+        }
+    }
+}
+
+// The four named instantiations the promoting engine's graph dispatches, so a
+// consumer can call them without being able to instantiate the template itself
+// (a separate translation unit per fatbin, and `--entries` prunes an unnamed
+// global). `q2`'s tile is 64 output columns x 8 rows with 2 staged input
+// channels, 8 blocks per SM; `catq0` is the same tile with the concat inputs.
+//
+// LAUNCH GEOMETRY, which is part of the contract because each template reads
+// blockIdx differently:
+//   q2 / catq0        grid = (ceil(wd/64), ceil(h/8), ceil(c_out/8)),
+//                     block = (16, 8, 1), channels on blockIdx.z
+//   q2ng2 / catq0ng2  grid = (ceil(ceil(c_out/8)/NG), ceil(h/8), ceil(wd/64)),
+//                     block = (16, 8, NG) - channels on blockIdx.x, NG on z.
+//                     NG must divide ceil(c_out/8), or part of the last group
+//                     goes unwritten.
+extern "C" __global__ void __launch_bounds__(16 * 8, 8)
+lg_conv3x3_q2(const float *__restrict__ in, const float *__restrict__ w,
+              const float *__restrict__ bias, float *__restrict__ out,
+              int c_in, int c_out, int h, int wd, int act, float act_p)
+{
+    lg_tile_body<16, 8, 4, 8, 2>(in, w, bias, out, c_in, c_out, h, wd, act, act_p);
+}
+
+extern "C" __global__ void __launch_bounds__(16 * 8 * 2, 4)
+lg_conv3x3_q2ng2(const float *__restrict__ in, const float *__restrict__ w,
+                 const float *__restrict__ bias, float *__restrict__ out,
+                 int c_in, int c_out, int h, int wd, int act, float act_p)
+{
+    lg_tile_body<16, 8, 4, 8, 2, 0, false, 0, 2>(in, w, bias, out, c_in, c_out, h, wd, act, act_p);
+}
+
+extern "C" __global__ void __launch_bounds__(16 * 8, 8)
+lg_conv3x3_catq0(const float *__restrict__ in, const float *__restrict__ w,
+                 const float *__restrict__ bias, float *__restrict__ out,
+                 int c_in, int c_out, int h, int wd, int act, float act_p,
+                 const float *__restrict__ i1, const float *__restrict__ i2,
+                 const float *__restrict__ i3, const float *__restrict__ i4,
+                 const float *__restrict__ i5,
+                 int g1, int g2, int g3, int g4, int g5, int ng)
+{
+    lg_tile_body<16, 8, 4, 8, 2, 0>(in, w, bias, out, c_in, c_out, h, wd, act, act_p,
+                                    i1, i2, i3, i4, i5, g1, g2, g3, g4, g5, ng);
+}
+
+extern "C" __global__ void __launch_bounds__(16 * 8 * 2, 4)
+lg_conv3x3_catq0ng2(const float *__restrict__ in, const float *__restrict__ w,
+                    const float *__restrict__ bias, float *__restrict__ out,
+                    int c_in, int c_out, int h, int wd, int act, float act_p,
+                    const float *__restrict__ i1, const float *__restrict__ i2,
+                    const float *__restrict__ i3, const float *__restrict__ i4,
+                    const float *__restrict__ i5,
+                    int g1, int g2, int g3, int g4, int g5, int ng)
+{
+    lg_tile_body<16, 8, 4, 8, 2, 0, false, 0, 2>(in, w, bias, out, c_in, c_out, h, wd, act, act_p,
+                                                 i1, i2, i3, i4, i5, g1, g2, g3, g4, g5, ng);
+}
