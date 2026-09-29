@@ -1181,6 +1181,240 @@ extern "C" __global__ void lg_attn_flash(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Batched-GEMM prefill attention: S = scale*QK^T + mask, row softmax, O = PV.
+//
+// The THIRD attention form, and the only one of the three that needs a score
+// matrix. `lg_attn_gqa` and `lg_attn_flash` both walk keys inside the softmax
+// loop (online rescale), which is what makes them right for DECODE - one query
+// token, or a growing cache - and wasteful for PREFILL, where the whole key set
+// is known up front and the same K/V is re-read once per query. Prefill is a
+// dense GEMM followed by a row softmax followed by a GEMM, and each stage is a
+// cache-friendly sweep rather than a per-key walk.
+//
+// Measured on the promoting engine (GTX 1080, sm_61, 1391-token prompt, 16
+// heads, hd 128, 36 layers): 5153 ms against `lg_attn_gqa`'s 8456 ms, -39% of
+// the LM prefill, with per-layer 14.1 ms scores / 1.2 ms softmax / 12.0 ms out.
+// The first version of this was a straight elementwise sweep - one thread per
+// (query, key) pair walking the dot product out of global memory - and it was
+// CORRECT BUT NO FASTER: 73 ms for the scores stage alone, because a k row was
+// re-read once per query row. Staging Q and K tiles in shared memory and giving
+// each thread a 4x4 register block is the whole difference.
+//
+//   q: [hd, n_qh, ntq]   k, v: [hd, n_kvh, ntk]   out: [hd, n_qh, ntq]
+//   s: [n_qh, ntq, ntk]  - the head is SLOWEST, so one head's slice is
+//                          contiguous and the softmax stage walks a row direct
+//   mask (may be null): [ntq, ntk] additive; use -FLT_MAX/4 rather than -inf
+//   ALL THREE require hd <= LA_HD_MAX (128). That is a documented precondition,
+//   not a silent assumption: the shared tiles are sized by it and stage 3 uses
+//   one thread per output channel at a 128-thread block. Reuse `LA_HD_MAX`
+//   rather than a bare 128 so raising it raises all three together.
+//
+// GQA: `n_kvh` may be less than `n_qh`; each kv head is used for
+// n_qh/n_kvh consecutive query heads, as in `lg_attn_gqa`.
+// ---------------------------------------------------------------------------
+
+#define LA_PF_QT 32    // query rows per block (scores)
+#define LA_PF_KT 32    // keys per block (scores)
+#define LA_PF_T  256   // staging threads: only the first 64 own a register block
+#define LA_PF_SM_T 256 // softmax reduction width
+#define LA_PF_OQT 16   // query rows per block (out)
+#define LA_PF_OKT 16   // keys staged per iteration (out)
+
+// Stage 1: s[h][i][j] = scale * dot(q_i, k_j) + mask[i][j].
+// A block owns a (query tile x key tile) of one head, stages both in shared
+// memory once, and then each thread multiplies a 4x4 register block - four query
+// rows against four keys - so each staged value feeds 4 dot products.
+// grid = (ceil(ntk/LA_PF_KT), ceil(ntq/LA_PF_QT), n_qh), block = (LA_PF_T).
+extern "C" __global__ void lg_attn_prefill_scores(
+    const float *__restrict__ q,
+    const float *__restrict__ k,
+    const float *__restrict__ mask,
+    float *__restrict__ s,
+    int hd, int n_qh, int n_kvh, int ntq, int ntk, float scale)
+{
+    // blockIdx.x = key tile, blockIdx.y = query tile, blockIdx.z = head
+    const int h = blockIdx.z;
+    const int q0 = blockIdx.y * LA_PF_QT;
+    const int k0 = blockIdx.x * LA_PF_KT;
+    if (q0 >= ntq || k0 >= ntk) return;
+
+    const int gq = h / (n_qh / n_kvh);   // kv head repeated n_qh/n_kvh times
+    const int tid = threadIdx.x;
+    // 8 x 8 grid of 4x4 register blocks inside the 32x32 tile.
+    const int rq = (tid / 8) * 4;        // first query row this thread owns
+    const int rk = (tid % 8) * 4;        // first key this thread owns
+
+    __shared__ float qs[LA_PF_QT * LA_HD_MAX];
+    __shared__ float ks[LA_PF_KT * LA_HD_MAX];
+
+    // Stage the tiles: thread t loads row (t/hd), element (t%hd).
+    const int nq = min(LA_PF_QT, ntq - q0);
+    const int nk = min(LA_PF_KT, ntk - k0);
+    for (int t = tid; t < LA_PF_QT * hd; t += LA_PF_T) {
+        const int r = t / hd, c = t % hd;
+        qs[(size_t)r * hd + c] = (r < nq)
+            ? q[(size_t)(q0 + r) * n_qh * hd + (size_t)h * hd + c]
+            : 0.0f;
+    }
+    for (int t = tid; t < LA_PF_KT * hd; t += LA_PF_T) {
+        const int r = t / hd, c = t % hd;
+        ks[(size_t)r * hd + c] = (r < nk)
+            ? k[(size_t)(k0 + r) * n_kvh * hd + (size_t)gq * hd + c]
+            : 0.0f;
+    }
+    __syncthreads();
+
+    // Only the first 64 threads own a 4x4 tile coordinate (8x8 blocks cover the
+    // 32x32 tile); the rest helped stage shared memory and must not compute, or
+    // they would index past the tile.
+    if (tid >= 64) return;
+
+    float acc[4][4];
+    for (int a = 0; a < 4; ++a)
+        for (int b = 0; b < 4; ++b) acc[a][b] = 0.0f;
+
+    for (int d = 0; d < hd; ++d) {
+        // Four query rows and four keys, one d at a time: each shared-memory
+        // read is shared by the whole 4x4 block's accumulators.
+        const float qv[4] = {
+            qs[(size_t)(rq + 0) * hd + d],
+            qs[(size_t)(rq + 1) * hd + d],
+            qs[(size_t)(rq + 2) * hd + d],
+            qs[(size_t)(rq + 3) * hd + d],
+        };
+        const float kv[4] = {
+            ks[(size_t)(rk + 0) * hd + d],
+            ks[(size_t)(rk + 1) * hd + d],
+            ks[(size_t)(rk + 2) * hd + d],
+            ks[(size_t)(rk + 3) * hd + d],
+        };
+        for (int a = 0; a < 4; ++a)
+            for (int b = 0; b < 4; ++b) acc[a][b] = fmaf(qv[a], kv[b], acc[a][b]);
+    }
+
+    for (int a = 0; a < 4; ++a) {
+        const int i = q0 + rq + a;
+        if (i >= ntq) break;
+        for (int b = 0; b < 4; ++b) {
+            const int j = k0 + rk + b;
+            if (j >= ntk) break;
+            float v = acc[a][b] * scale;
+            if (mask) v += mask[(size_t)i * ntk + j];
+            s[((size_t)h * ntq + i) * ntk + j] = v;
+        }
+    }
+}
+
+// Stage 2: in-place row softmax over the key axis of s[h][i][:].
+// One block per (head, query), so the max-then-sum two-pass is a block-wide
+// reduction over a contiguous row. 1.2 ms per layer against 73 ms for the
+// scores stage on the promoting engine, so it is deliberately left simple.
+// grid = (1, ntq, n_qh), block = (LA_PF_SM_T).
+extern "C" __global__ void lg_attn_prefill_softmax(
+    float *__restrict__ s, int ntq, int ntk)
+{
+    const int h = blockIdx.z;
+    const int i = blockIdx.y;
+    float *row = s + ((size_t)h * ntq + i) * ntk;
+    const int tid = threadIdx.x;
+
+    __shared__ float red[LA_PF_SM_T];
+    float m = -INFINITY;   // as lg_attn_gqa: this file does not include math_constants.h
+    for (int j = tid; j < ntk; j += LA_PF_SM_T) m = fmaxf(m, row[j]);
+    red[tid] = m;
+    __syncthreads();
+    for (int off = LA_PF_SM_T / 2; off > 0; off >>= 1) {
+        if (tid < off) red[tid] = fmaxf(red[tid], red[tid + off]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+
+    // exp relative to the row max. The mask is additive (-FLT_MAX/4 on masked
+    // pairs), so a masked entry subtracts to exp(-FLT_MAX/4 - m) = 0 and drops
+    // out of both the numerator and the denominator - no special case needed.
+    float l = 0.0f;
+    for (int j = tid; j < ntk; j += LA_PF_SM_T) {
+        const float e = __expf(row[j] - m);
+        row[j] = e;
+        l += e;
+    }
+    red[tid] = l;
+    __syncthreads();
+    for (int off = LA_PF_SM_T / 2; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    l = red[0];
+    // A fully-masked row would give l == 0. A causal mask always leaves the
+    // diagonal unmasked so this is unreachable there, but 1/0 would put NaN in
+    // the residual and NaN is far harder to trace than a zero row.
+    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int j = tid; j < ntk; j += LA_PF_SM_T) row[j] *= inv;
+}
+
+// Stage 3: out[h][i][d] = sum_j p[h][i][j] * v[j][gq][d].
+// A block owns a query tile of one head and all of hd, one thread per output
+// channel, with V rows staged a tile at a time - which turns the DRAM traffic
+// from (one V row per output element) into (one V row per block).
+// grid = (1, ceil(ntq/LA_PF_OQT), n_qh), block = (LA_HD_MAX).
+extern "C" __global__ void lg_attn_prefill_out(
+    const float *__restrict__ p,
+    const float *__restrict__ v,
+    float *__restrict__ out,
+    int hd, int n_qh, int n_kvh, int ntq, int ntk)
+{
+    const int h = blockIdx.z;
+    const int q0 = blockIdx.y * LA_PF_OQT;
+    if (q0 >= ntq) return;
+
+    const int gq = h / (n_qh / n_kvh);
+    const int d = threadIdx.x;                 // one output channel per thread
+    const bool has_d = d < hd;
+
+    __shared__ float ps[LA_PF_OQT * LA_PF_OKT];
+    __shared__ float vs[LA_PF_OKT * LA_HD_MAX];
+
+    const int nq = min(LA_PF_OQT, ntq - q0);
+    float acc[LA_PF_OQT];
+    for (int a = 0; a < LA_PF_OQT; ++a) acc[a] = 0.0f;
+
+    for (int kk = 0; kk < ntk; kk += LA_PF_OKT) {
+        const int nk = min(LA_PF_OKT, ntk - kk);
+        // Stage P[q0..q0+nq, kk..kk+nk] and V[kk..kk+nk, :].
+        for (int t = threadIdx.x; t < LA_PF_OQT * LA_PF_OKT; t += LA_HD_MAX) {
+            const int a = t / LA_PF_OKT, b = t % LA_PF_OKT;
+            ps[(size_t)a * LA_PF_OKT + b] = (a < nq && b < nk)
+                ? p[((size_t)h * ntq + q0 + a) * ntk + kk + b]
+                : 0.0f;
+        }
+        for (int t = threadIdx.x; t < LA_PF_OKT * hd; t += LA_HD_MAX) {
+            const int r = t / hd, c = t % hd;
+            vs[(size_t)r * hd + c] = (r < nk)
+                ? v[(size_t)(kk + r) * n_kvh * hd + (size_t)gq * hd + c]
+                : 0.0f;
+        }
+        __syncthreads();
+
+        if (has_d) {
+            for (int b = 0; b < nk; ++b) {
+                const float vv = vs[(size_t)b * hd + d];
+                for (int a = 0; a < nq; ++a) {
+                    acc[a] = fmaf(ps[(size_t)a * LA_PF_OKT + b], vv, acc[a]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (has_d) {
+        for (int a = 0; a < nq; ++a) {
+            out[(size_t)(q0 + a) * n_qh * hd + (size_t)h * hd + d] = acc[a];
+        }
+    }
+}
+
 // ===========================================================================
 // 9. Linear layer in the token layout (C, 1, h*w)
 //    (y, x, c) at c*h*w + y*w + x)
