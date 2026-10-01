@@ -1338,8 +1338,15 @@ extern "C" __global__ void lg_attn_prefill_scores(
 // grid = (1, ceil(ntq/LA_F_QT), n_qh), block = (LA_F_QT * 32).
 // ---------------------------------------------------------------------------
 
+#ifndef LA_F_QT
 #define LA_F_QT 32    // query rows per block (one warp each)
+#endif
+// Guarded so the key tile can be swept from the nvcc command line (-DLA_F_KT=32)
+// without editing the file: shared memory is sized by it, so it is a
+// compile-time constant, but the best value is a measurement question.
+#ifndef LA_F_KT
 #define LA_F_KT 16    // keys staged per iteration
+#endif
 
 extern "C" __global__ void lg_attn_prefill_fused(
     const float *__restrict__ q,
@@ -1428,11 +1435,23 @@ extern "C" __global__ void lg_attn_prefill_fused(
             s = s * scale;
             if (live && mask) s += mask[(size_t)i * ntk + (k0 + r)];
 
-            // ---- online softmax update, broadcast m/l so all lanes agree.
-            const float mn = fmaxf(m, s);
-            const float corr = __expf(m - mn);   // rescale the running sum
-            const float p = __expf(s - mn);
-            l = l * corr + p;
+            // ---- online softmax update. After the reduction above every lane
+            // holds the SAME s, so letting all 32 lanes evaluate __expf would
+            // compute the same two transcendentals 32 times over: at ntk=5408
+            // that is ~345k MUFU ops per query row against ~10.7k for the
+            // three-stage softmax, which is where this kernel's time goes.
+            // Lane 0 evaluates them once and broadcasts the three scalars; a
+            // shuffle is cheaper than MUFU.
+            float mn, corr, p;
+            if (lane == 0) {
+                mn = fmaxf(m, s);
+                corr = __expf(m - mn);   // rescale the running sum
+                p = __expf(s - mn);
+                l = l * corr + p;
+            }
+            mn   = __shfl_sync(0xffffffffu, mn, 0);
+            corr = __shfl_sync(0xffffffffu, corr, 0);
+            p    = __shfl_sync(0xffffffffu, p, 0);
             m = mn;
 #pragma unroll
             for (int c = 0; c < LA_DPL; ++c) {
@@ -1450,7 +1469,10 @@ extern "C" __global__ void lg_attn_prefill_fused(
     // normalisation is left. Compare lg_attn_prefill_out, which re-reads the
     // score matrix to do this.
     if (!live) return;
-    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    // Only lane 0 accumulated l (see above), so the reciprocal is computed
+    // there and broadcast - every lane needs it to scale its own channels.
+    float inv = (lane == 0) ? ((l > 0.0f) ? 1.0f / l : 0.0f) : 0.0f;
+    inv = __shfl_sync(0xffffffffu, inv, 0);
 #pragma unroll
     for (int c = 0; c < LA_DPL; ++c) {
         const int d = c * 32 + lane;
