@@ -6,3 +6,17 @@ target/
 # is unanchored, so it covers build-support/Cargo.lock as well, and Cargo keeps
 # only one lock per workspace - the root one, which this ignores.
 Cargo.lock
+
+# nvcc -keep output. Inspecting PTX/cubin is routine while tuning a kernel, and
+# -keep writes it next to the source rather than to OUT_DIR, so a `git add -A`
+# would otherwise commit ~250k lines of generated C and PTX.
+*.ii
+*.cudafe1.c
+*.cudafe1.cpp
+*.cudafe1.gpu
+*.cudafe1.stub.c
+*.fatbin
+*.fatbin.c
+*.module_id
+*.ptx
+*.cubin
