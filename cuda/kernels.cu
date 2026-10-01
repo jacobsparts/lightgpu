@@ -1306,6 +1306,160 @@ extern "C" __global__ void lg_attn_prefill_scores(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fused attention: one kernel does scores -> softmax -> PV for a tile of
+// query rows, so the [n_qh, ntq, ntk] score matrix is NEVER materialised.
+//
+// Why this exists: the three stages above write s to DRAM and read it back
+// twice (once for the softmax, once for PV). At the promoting engine's
+// ViT shape that round trip is ~1.87 GB/layer of traffic, and both GEMM
+// stages also re-read an operand once per query tile. This kernel reads
+// Q once, streams K/V once per query tile, and keeps the running
+// (max, sum, acc) in registers, so s stays entirely on chip.
+//
+// Mapping: ONE WARP PER QUERY ROW. The head dimension is spread across the
+// 32 lanes (each lane owns hd/32 <= LA_DPL channels), so a query row's
+// whole accumulator vector lives in its warp's registers and the online
+// softmax needs no cross-warp reduction at all. That is what lets QT be
+// large without a block-wide reduction per row.
+//
+// Shared budget at hd = LA_HD_MAX (128): only K and V are staged, a double
+// buffer of 2*KT*128*4 = KT*1024 B. Q lives in registers, so QT does not
+// affect shared memory at all and the whole budget goes to the key tile:
+//   KT=16 -> 16 KiB   (used here)
+//   KT=32 -> 32 KiB
+//   KT=48 -> 48 KiB   (exactly sm_61's per-block limit)
+// So LA_F_KT must satisfy 2*LA_F_KT*1024 <= 48 KiB, i.e. KT <= 48. Raising
+// KT past that fails at launch, not at compile time, so the precondition is
+// asserted in the host wrapper - see ops/mod.rs.
+//
+// Requires: hd <= LA_HD_MAX, and hd % 32 == 0 is NOT required (lanes past
+// hd sit idle, which is a small waste at hd=72 but keeps one code path).
+// grid = (1, ceil(ntq/LA_F_QT), n_qh), block = (LA_F_QT * 32).
+// ---------------------------------------------------------------------------
+
+#define LA_F_QT 32    // query rows per block (one warp each)
+#define LA_F_KT 16    // keys staged per iteration
+
+extern "C" __global__ void lg_attn_prefill_fused(
+    const float *__restrict__ q,
+    const float *__restrict__ k,
+    const float *__restrict__ v,
+    const float *__restrict__ mask,
+    float *__restrict__ out,
+    int hd, int n_qh, int n_kvh, int ntq, int ntk, float scale)
+{
+    // blockIdx.y = query tile, blockIdx.z = head
+    const int h = blockIdx.z;
+    const int gq = h / (n_qh / n_kvh);   // kv head repeated n_qh/n_kvh times
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;           // which query row this warp owns
+    const int lane = tid & 31;           // channel offset within the row
+
+    const int i = blockIdx.y * LA_F_QT + warp;   // global query row
+    const bool live = (i < ntq);
+
+    // No shared Q tile: each warp loads its own query row straight into
+    // registers (see below) and holds it for the whole key sweep, so a shared
+    // copy would be pure duplication - 16 KiB of dead shared memory at QT=32,
+    // which costs occupancy for nothing.
+    __shared__ float ksh[LA_F_KT * LA_HD_MAX];
+    __shared__ float vsh[LA_F_KT * LA_HD_MAX];
+
+    // ---- stage Q: this warp's own query row, so the load is one row of hd
+    // floats spread across the lanes (coalesced) and each lane keeps its
+    // channels in registers for the whole key sweep.
+    float qreg[LA_DPL];
+#pragma unroll
+    for (int c = 0; c < LA_DPL; ++c) {
+        const int d = c * 32 + lane;
+        qreg[c] = (live && d < hd)
+            ? q[(size_t)i * n_qh * hd + (size_t)h * hd + d]
+            : 0.0f;
+    }
+
+    // Online softmax state, one value per lane: m/l are scalars shared across
+    // the warp by broadcast, acc is per-channel.
+    float m = -INFINITY;   // as lg_attn_gqa: no math_constants.h in this file
+    float l = 0.0f;
+    float acc[LA_DPL];
+#pragma unroll
+    for (int c = 0; c < LA_DPL; ++c) acc[c] = 0.0f;
+
+    const int qbase = blockIdx.y * LA_F_QT;
+    const int nq = min(LA_F_QT, ntq - qbase);
+
+    for (int k0 = 0; k0 < ntk; k0 += LA_F_KT) {
+        const int nk = min(LA_F_KT, ntk - k0);
+
+        // ---- stage K and V for this key tile. All warps cooperate: the load
+        // is a flat sweep over nk*hd floats, so the block's threads cover it
+        // regardless of which query row they own.
+        for (int t = tid; t < LA_F_KT * hd; t += LA_F_QT * 32) {
+            const int r = t / hd, c = t % hd;
+            const float kvv = (r < nk)
+                ? k[(size_t)(k0 + r) * n_kvh * hd + (size_t)gq * hd + c]
+                : 0.0f;
+            ksh[(size_t)r * hd + c] = kvv;
+        }
+        for (int t = tid; t < LA_F_KT * hd; t += LA_F_QT * 32) {
+            const int r = t / hd, c = t % hd;
+            const float vvv = (r < nk)
+                ? v[(size_t)(k0 + r) * n_kvh * hd + (size_t)gq * hd + c]
+                : 0.0f;
+            vsh[(size_t)r * hd + c] = vvv;
+        }
+        __syncthreads();
+
+        // ---- scores for this warp's query row against the staged keys.
+        // Each lane computes the dot product of the channels it owns, then a
+        // warp reduction makes every lane hold the FULL score for its key.
+        for (int r = 0; r < nk; ++r) {
+            float s = 0.0f;
+#pragma unroll
+            for (int c = 0; c < LA_DPL; ++c) {
+                const int d = c * 32 + lane;
+                if (d < hd) s = fmaf(qreg[c], ksh[(size_t)r * hd + d], s);
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                s += __shfl_xor_sync(0xffffffffu, s, off);
+
+            s = s * scale;
+            if (live && mask) s += mask[(size_t)i * ntk + (k0 + r)];
+
+            // ---- online softmax update, broadcast m/l so all lanes agree.
+            const float mn = fmaxf(m, s);
+            const float corr = __expf(m - mn);   // rescale the running sum
+            const float p = __expf(s - mn);
+            l = l * corr + p;
+            m = mn;
+#pragma unroll
+            for (int c = 0; c < LA_DPL; ++c) {
+                const int d = c * 32 + lane;
+                if (d < hd) {
+                    acc[c] = acc[c] * corr
+                           + p * vsh[(size_t)r * hd + d];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- write: acc already holds the softmax-weighted sum, so only the 1/l
+    // normalisation is left. Compare lg_attn_prefill_out, which re-reads the
+    // score matrix to do this.
+    if (!live) return;
+    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+#pragma unroll
+    for (int c = 0; c < LA_DPL; ++c) {
+        const int d = c * 32 + lane;
+        if (d < hd) {
+            out[(size_t)i * n_qh * hd + (size_t)h * hd + d] = acc[c] * inv;
+        }
+    }
+}
+
 // Stage 2: in-place row softmax over the key axis of s[h][i][:].
 // One block per (head, query), so the max-then-sum two-pass is a block-wide
 // reduction over a contiguous row. 1.2 ms per layer against 73 ms for the
