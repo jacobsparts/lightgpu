@@ -1338,8 +1338,13 @@ extern "C" __global__ void lg_attn_prefill_scores(
 // grid = (1, ceil(ntq/LA_F_QT), n_qh), block = (LA_F_QT * 32).
 // ---------------------------------------------------------------------------
 
+// One warp per query row, so this is ALSO the thread count (LA_F_QT * 32) and
+// therefore sets the register footprint of a block. At QT=32 that is 1024
+// threads at ~48 registers = ~49 KB of registers, which fits only ONE block per
+// SM (65,536 registers) - 50% occupancy with no second block to hide latency.
+// 16 halves it to 512 threads and two blocks per SM.
 #ifndef LA_F_QT
-#define LA_F_QT 32    // query rows per block (one warp each)
+#define LA_F_QT 16    // query rows per block (one warp each)
 #endif
 // Guarded so the key tile can be swept from the nvcc command line (-DLA_F_KT=32)
 // without editing the file: shared memory is sized by it, so it is a
@@ -1435,23 +1440,17 @@ extern "C" __global__ void lg_attn_prefill_fused(
             s = s * scale;
             if (live && mask) s += mask[(size_t)i * ntk + (k0 + r)];
 
-            // ---- online softmax update. After the reduction above every lane
-            // holds the SAME s, so letting all 32 lanes evaluate __expf would
-            // compute the same two transcendentals 32 times over: at ntk=5408
-            // that is ~345k MUFU ops per query row against ~10.7k for the
-            // three-stage softmax, which is where this kernel's time goes.
-            // Lane 0 evaluates them once and broadcasts the three scalars; a
-            // shuffle is cheaper than MUFU.
-            float mn, corr, p;
-            if (lane == 0) {
-                mn = fmaxf(m, s);
-                corr = __expf(m - mn);   // rescale the running sum
-                p = __expf(s - mn);
-                l = l * corr + p;
-            }
-            mn   = __shfl_sync(0xffffffffu, mn, 0);
-            corr = __shfl_sync(0xffffffffu, corr, 0);
-            p    = __shfl_sync(0xffffffffu, p, 0);
+            // ---- online softmax update, all lanes redundantly. Every lane
+            // holds the same s after the reduction, so all 32 evaluate the same
+            // two __expf - but nvcc already hoists them (PTX shows 2 ex2.approx
+            // either way), so MEASURED: moving this to lane 0 + three shuffles
+            // made the kernel ~13% SLOWER, because those shuffles land in the
+            // innermost loop (one iteration per key) and buy nothing. Kept
+            // uniform across lanes deliberately.
+            const float mn = fmaxf(m, s);
+            const float corr = __expf(m - mn);   // rescale the running sum
+            const float p = __expf(s - mn);
+            l = l * corr + p;
             m = mn;
 #pragma unroll
             for (int c = 0; c < LA_DPL; ++c) {
@@ -1469,10 +1468,8 @@ extern "C" __global__ void lg_attn_prefill_fused(
     // normalisation is left. Compare lg_attn_prefill_out, which re-reads the
     // score matrix to do this.
     if (!live) return;
-    // Only lane 0 accumulated l (see above), so the reciprocal is computed
-    // there and broadcast - every lane needs it to scale its own channels.
-    float inv = (lane == 0) ? ((l > 0.0f) ? 1.0f / l : 0.0f) : 0.0f;
-    inv = __shfl_sync(0xffffffffu, inv, 0);
+    // Every lane holds the same l (see above), so no broadcast is needed.
+    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
 #pragma unroll
     for (int c = 0; c < LA_DPL; ++c) {
         const int d = c * 32 + lane;
