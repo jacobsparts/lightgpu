@@ -1338,13 +1338,14 @@ extern "C" __global__ void lg_attn_prefill_scores(
 // grid = (1, ceil(ntq/LA_F_QT), n_qh), block = (LA_F_QT * 32).
 // ---------------------------------------------------------------------------
 
-// One warp per query row, so this is ALSO the thread count (LA_F_QT * 32) and
-// therefore sets the register footprint of a block. At QT=32 that is 1024
-// threads at ~48 registers = ~49 KB of registers, which fits only ONE block per
-// SM (65,536 registers) - 50% occupancy with no second block to hide latency.
-// 16 halves it to 512 threads and two blocks per SM.
+// One warp per query row, so this is ALSO the thread count (LA_F_QT * 32).
+// MEASURED 32 beats 16 (11738 vs 12211 ms over the 27 ViT layers) even though
+// the two have IDENTICAL occupancy: 32*32=1024 threads at 48 regs fits one
+// block per SM, and 16*32=512 threads fits two, both yielding 1024 threads/SM
+// (50%). So occupancy does not explain the difference - 16 loses because it
+// doubles the number of blocks and each one re-reads the full K/V sweep.
 #ifndef LA_F_QT
-#define LA_F_QT 16    // query rows per block (one warp each)
+#define LA_F_QT 32    // query rows per block (one warp each)
 #endif
 // Guarded so the key tile can be swept from the nvcc command line (-DLA_F_KT=32)
 // without editing the file: shared memory is sized by it, so it is a
