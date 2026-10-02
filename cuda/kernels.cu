@@ -1390,7 +1390,7 @@ extern "C" __global__ void lg_attn_prefill_out(
                 ? p[((size_t)h * ntq + q0 + a) * ntk + kk + b]
                 : 0.0f;
         }
-        for (int t = threadIdx.x; t < LA_PF_OKT * hd; t += LA_HD_MAX) {
+        for (int t = threadIdx.x; t < LA_PF_OKT * hd; t += blockDim.x) {
             const int r = t / hd, c = t % hd;
             vs[(size_t)r * hd + c] = (r < nk)
                 ? v[(size_t)(kk + r) * n_kvh * hd + (size_t)gq * hd + c]
@@ -1474,78 +1474,67 @@ extern "C" __global__ void lg_f32_gemm(
     y[(size_t)c * ne1 + j] = acc;
 }
 
-// f32 GEMM, v8-style tiling: 64 rows x 32 columns per 256-thread block (32 row
-// lanes x 8 column slots, 2 rows x 4 columns per thread = 8 accumulators). The
-// 32 columns' current k-step (one float4 each) is staged in shared memory so
-// the activation float4 is loaded once per block-k-step instead of once per
-// row lane. No k-split: the tiles are numerous enough.
-// grid = (ceil(ne1/64), ceil(ncols/32)). Requires ne0 % 4 == 0.
+// f32 GEMM: 64 rows x 32 columns per 256-thread block. Both the w tile
+// (BM x BK) and the x tile (BN x BK) are staged in shared memory once per
+// k-step, and each thread owns a 4x2 register block (TM=4, TN=2) so every
+// staged value feeds several accumulators. The staging loops walk the tile
+// as (r = i/BK, k = i%BK) so consecutive threads read consecutive k at a
+// fixed row - a coalesced load. The older body left w in registers and let
+// the 8 column-slot threads re-read the same float4, costing 8x the w
+// traffic; staging both tiles is what removes that. No k-split: the tiles
+// are numerous enough.
+// grid = (ceil(ne1/64), ceil(ncols/32)), block = 256. Requires ne1,ncols > 0.
 extern "C" __global__ void lg_f32_gemm_tiled(
     const float *__restrict__ w, const float *__restrict__ x, float *__restrict__ y,
     int ne0, int ne1, int ncols)
 {
-    __shared__ float xs[32 * 4];
+    const int BM = 64, BN = 32, BK = 8, TM = 4, TN = 2;
+    __shared__ float As[BK][BM + 4];
+    __shared__ float Bs[BK][BN + 4];
     const int tid = threadIdx.x;
-    const int jl  = tid & 31;
-    const int cs  = tid >> 5;
-    const int j0  = blockIdx.x * 64;
-    const int c0  = blockIdx.y * 32;
+    const int ntc = BN / TN;                 // thread columns per block
+    const int tr = tid / ntc;
+    const int tc = tid % ntc;
+    const int r0 = blockIdx.x * BM;
+    const int c0 = blockIdx.y * BN;
 
-    const int r0 = j0 + jl;
-    const int r1 = r0 + 32;
-    const int cA = c0 + cs * 4;
-    const bool ur0 = r0 < ne1;
-    const bool ur1 = r1 < ne1;
-    const bool uc0 = cA + 0 < ncols, uc1 = cA + 1 < ncols;
-    const bool uc2 = cA + 2 < ncols, uc3 = cA + 3 < ncols;
+    float acc[TM][TN];
+    for (int i = 0; i < TM; ++i)
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.f;
 
-    const float *w0 = w + (size_t)r0 * ne0;
-    const float *w1 = w + (size_t)r1 * ne0;
+    const int ntiles = (ne0 + BK - 1) / BK;
+    for (int t = 0; t < ntiles; ++t) {
+        // Stage w[r0..r0+BM, t*BK..] and x[c0..c0+BN, t*BK..].
+        for (int i = tid; i < BK * BM; i += 256) {
+            const int r = i / BK, k = i % BK;
+            const int rr = r0 + r, kk = t * BK + k;
+            As[k][r] = (rr < ne1 && kk < ne0) ? w[(size_t)rr * ne0 + kk] : 0.f;
+        }
+        for (int i = tid; i < BK * BN; i += 256) {
+            const int c = i / BK, k = i % BK;
+            const int cc = c0 + c, kk = t * BK + k;
+            Bs[k][c] = (cc < ncols && kk < ne0) ? x[(size_t)cc * ne0 + kk] : 0.f;
+        }
+        __syncthreads();
 
-    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a03 = 0.f;
-    float a10 = 0.f, a11 = 0.f, a12 = 0.f, a13 = 0.f;
+        for (int k = 0; k < BK; ++k) {
+            float a[TM], b[TN];
+            for (int i = 0; i < TM; ++i) a[i] = As[k][tr * TM + i];
+            for (int j = 0; j < TN; ++j) b[j] = Bs[k][tc * TN + j];
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j)
+                    acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
 
-    for (int k = 0; k + 4 <= ne0; k += 4) {
-        if (tid < 32) {
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (c0 + tid < ncols) {
-                v = *reinterpret_cast<const float4 *>(x + (size_t)(c0 + tid) * ne0 + k);
+    for (int i = 0; i < TM; ++i) {
+        const int r = r0 + tr * TM + i;
+        if (r < ne1)
+            for (int j = 0; j < TN; ++j) {
+                const int c = c0 + tc * TN + j;
+                if (c < ncols) y[(size_t)c * ne1 + r] = acc[i][j];
             }
-            xs[tid * 4 + 0] = v.x; xs[tid * 4 + 1] = v.y;
-            xs[tid * 4 + 2] = v.z; xs[tid * 4 + 3] = v.w;
-        }
-        __syncthreads();
-        const float4 xv0 = *reinterpret_cast<const float4 *>(&xs[(cs * 4 + 0) * 4]);
-        const float4 xv1 = *reinterpret_cast<const float4 *>(&xs[(cs * 4 + 1) * 4]);
-        const float4 xv2 = *reinterpret_cast<const float4 *>(&xs[(cs * 4 + 2) * 4]);
-        const float4 xv3 = *reinterpret_cast<const float4 *>(&xs[(cs * 4 + 3) * 4]);
-        if (ur0) {
-            const float4 wv = *reinterpret_cast<const float4 *>(w0 + k);
-            if (uc0) { a00 = fmaf(wv.x, xv0.x, a00); a00 = fmaf(wv.y, xv0.y, a00); a00 = fmaf(wv.z, xv0.z, a00); a00 = fmaf(wv.w, xv0.w, a00); }
-            if (uc1) { a01 = fmaf(wv.x, xv1.x, a01); a01 = fmaf(wv.y, xv1.y, a01); a01 = fmaf(wv.z, xv1.z, a01); a01 = fmaf(wv.w, xv1.w, a01); }
-            if (uc2) { a02 = fmaf(wv.x, xv2.x, a02); a02 = fmaf(wv.y, xv2.y, a02); a02 = fmaf(wv.z, xv2.z, a02); a02 = fmaf(wv.w, xv2.w, a02); }
-            if (uc3) { a03 = fmaf(wv.x, xv3.x, a03); a03 = fmaf(wv.y, xv3.y, a03); a03 = fmaf(wv.z, xv3.z, a03); a03 = fmaf(wv.w, xv3.w, a03); }
-        }
-        if (ur1) {
-            const float4 wv = *reinterpret_cast<const float4 *>(w1 + k);
-            if (uc0) { a10 = fmaf(wv.x, xv0.x, a10); a10 = fmaf(wv.y, xv0.y, a10); a10 = fmaf(wv.z, xv0.z, a10); a10 = fmaf(wv.w, xv0.w, a10); }
-            if (uc1) { a11 = fmaf(wv.x, xv1.x, a11); a11 = fmaf(wv.y, xv1.y, a11); a11 = fmaf(wv.z, xv1.z, a11); a11 = fmaf(wv.w, xv1.w, a11); }
-            if (uc2) { a12 = fmaf(wv.x, xv2.x, a12); a12 = fmaf(wv.y, xv2.y, a12); a12 = fmaf(wv.z, xv2.z, a12); a12 = fmaf(wv.w, xv2.w, a12); }
-            if (uc3) { a13 = fmaf(wv.x, xv3.x, a13); a13 = fmaf(wv.y, xv3.y, a13); a13 = fmaf(wv.z, xv3.z, a13); a13 = fmaf(wv.w, xv3.w, a13); }
-        }
-        __syncthreads();
-    }
-    if (ur0) {
-        if (uc0) y[(size_t)(cA + 0) * ne1 + r0] = a00;
-        if (uc1) y[(size_t)(cA + 1) * ne1 + r0] = a01;
-        if (uc2) y[(size_t)(cA + 2) * ne1 + r0] = a02;
-        if (uc3) y[(size_t)(cA + 3) * ne1 + r0] = a03;
-    }
-    if (ur1) {
-        if (uc0) y[(size_t)(cA + 0) * ne1 + r1] = a10;
-        if (uc1) y[(size_t)(cA + 1) * ne1 + r1] = a11;
-        if (uc2) y[(size_t)(cA + 2) * ne1 + r1] = a12;
-        if (uc3) y[(size_t)(cA + 3) * ne1 + r1] = a13;
     }
 }
 
