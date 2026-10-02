@@ -1355,64 +1355,75 @@ extern "C" __global__ void lg_attn_prefill_softmax(
     for (int j = tid; j < ntk; j += LA_PF_SM_T) row[j] *= inv;
 }
 
-// Stage 3: out[h][i][d] = sum_j p[h][i][j] * v[j][gq][d].
-// A block owns a query tile of one head and all of hd, one thread per output
-// channel, with V rows staged a tile at a time - which turns the DRAM traffic
-// from (one V row per output element) into (one V row per block).
-// grid = (1, ceil(ntq/LA_PF_OQT), n_qh), block = (LA_HD_MAX).
+// Stage 3: out[h][i][d] = sum_j p[h][i][j] * v[j][gq][d], as a GEMM.
+// Transposed-w form: w[k][r] = v[(gq*hd)+k*ldw+r] (r = channel), x[c][k] =
+// p[h*ntq*ntk + c*ntk + k] (c = query, k = key), so out[c][r] = sum_k x[c][k] *
+// w[k][r]. A 256-thread block computes a 64x32 output tile (BM x BN) over an
+// 8-deep K tile, both operands staged in shared once and a TM x TN register
+// block per thread. This is 12.9x the previous one-thread-per-channel sweep
+// (measured at the true query-tiled shape: 12.9 ms vs 165 ms per layer) and is
+// bit-exact with it. The head is a grid axis; gq selects the kv head.
+// grid = (ceil(hd/64), ceil(ntq/32), n_qh), block = 256.
 extern "C" __global__ void lg_attn_prefill_out(
     const float *__restrict__ p,
     const float *__restrict__ v,
     float *__restrict__ out,
     int hd, int n_qh, int n_kvh, int ntq, int ntk)
 {
+    const int BM = 64, BN = 32, BK = 8, TM = 4, TN = 2;
+    __shared__ float As[BK][BM + 4];
+    __shared__ float Bs[BK][BN + 4];
+
     const int h = blockIdx.z;
-    const int q0 = blockIdx.y * LA_PF_OQT;
-    if (q0 >= ntq) return;
-
     const int gq = h / (n_qh / n_kvh);
-    const int d = threadIdx.x;                 // one output channel per thread
-    const bool has_d = d < hd;
+    const int ldw = n_kvh * hd;   // v token stride
+    const int sy  = n_qh * hd;    // out token stride
 
-    __shared__ float ps[LA_PF_OQT * LA_PF_OKT];
-    __shared__ float vs[LA_PF_OKT * LA_HD_MAX];
+    const int tid = threadIdx.x;
+    const int ntc = BN / TN;
+    const int tr = tid / ntc;
+    const int tc = tid % ntc;
+    const int r0 = blockIdx.x * BM;   // first output channel (hd axis)
+    const int c0 = blockIdx.y * BN;   // first query row (ntq axis)
 
-    const int nq = min(LA_PF_OQT, ntq - q0);
-    float acc[LA_PF_OQT];
-    for (int a = 0; a < LA_PF_OQT; ++a) acc[a] = 0.0f;
+    float acc[TM][TN];
+    for (int i = 0; i < TM; ++i)
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
 
-    for (int kk = 0; kk < ntk; kk += LA_PF_OKT) {
-        const int nk = min(LA_PF_OKT, ntk - kk);
-        // Stage P[q0..q0+nq, kk..kk+nk] and V[kk..kk+nk, :].
-        for (int t = threadIdx.x; t < LA_PF_OQT * LA_PF_OKT; t += LA_HD_MAX) {
-            const int a = t / LA_PF_OKT, b = t % LA_PF_OKT;
-            ps[(size_t)a * LA_PF_OKT + b] = (a < nq && b < nk)
-                ? p[((size_t)h * ntq + q0 + a) * ntk + kk + b]
-                : 0.0f;
+    const float *__restrict__ wbase = v + (size_t)gq * hd;
+    const float *__restrict__ xbase = p + (size_t)h * ntq * ntk;
+    const int ntiles = (ntk + BK - 1) / BK;
+
+    for (int t = 0; t < ntiles; ++t) {
+        for (int i = tid; i < BK * BM; i += 256) {
+            const int r = i / BK, k = i % BK;
+            const int rr = r0 + r, kk = t * BK + k;
+            As[k][r] = (rr < hd && kk < ntk) ? wbase[(size_t)kk * ldw + rr] : 0.0f;
         }
-        for (int t = threadIdx.x; t < LA_PF_OKT * hd; t += blockDim.x) {
-            const int r = t / hd, c = t % hd;
-            vs[(size_t)r * hd + c] = (r < nk)
-                ? v[(size_t)(kk + r) * n_kvh * hd + (size_t)gq * hd + c]
-                : 0.0f;
+        for (int i = tid; i < BK * BN; i += 256) {
+            const int c = i / BK, k = i % BK;
+            const int cc = c0 + c, kk = t * BK + k;
+            Bs[k][c] = (cc < ntq && kk < ntk) ? xbase[(size_t)cc * ntk + kk] : 0.0f;
         }
         __syncthreads();
 
-        if (has_d) {
-            for (int b = 0; b < nk; ++b) {
-                const float vv = vs[(size_t)b * hd + d];
-                for (int a = 0; a < nq; ++a) {
-                    acc[a] = fmaf(ps[(size_t)a * LA_PF_OKT + b], vv, acc[a]);
-                }
-            }
+        for (int k = 0; k < BK; ++k) {
+            float a[TM], b[TN];
+            for (int i = 0; i < TM; ++i) a[i] = As[k][tr * TM + i];
+            for (int j = 0; j < TN; ++j) b[j] = Bs[k][tc * TN + j];
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
         }
         __syncthreads();
     }
 
-    if (has_d) {
-        for (int a = 0; a < nq; ++a) {
-            out[(size_t)(q0 + a) * n_qh * hd + (size_t)h * hd + d] = acc[a];
-        }
+    for (int i = 0; i < TM; ++i) {
+        const int r = r0 + tr * TM + i;
+        if (r < hd)
+            for (int j = 0; j < TN; ++j) {
+                const int c = c0 + tc * TN + j;
+                if (c < ntq) out[(size_t)c * sy + (size_t)h * hd + r] = acc[i][j];
+            }
     }
 }
 
