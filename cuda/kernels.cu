@@ -1805,6 +1805,89 @@ extern "C" __global__ void lg_q8_0_gemm_dp4a(
 
 // Scalar q8_0 GEMM over the ALIGNED 36-byte layout: one thread per output
 // element, used for the single-column lm_head projection.
+
+// Tiled q8_0 GEMM with 4x the arithmetic intensity of lg_q8_0_gemm_dp4a:
+// BM=128 x BN=64 output tile, BK=32 reduction tile (= exactly one q8_0 block),
+// TM=8 x TN=4 = 32 int outputs per thread. The per-block int dp4a accumulator
+// is folded against the fp16 scale once per BK tile (matching the reference
+// accumulation order, so results stay bit-exact). locate-anything exclusive
+// (grid differs from the shared dispatch contract). y[col][row].
+// grid = (ceil(ne1/128), ceil(ncols/64)), block = (256,1,1).
+extern "C" __global__ void lg_q8_0_gemm_tiled2(
+    const uint8_t *__restrict__ w, const int8_t *__restrict__ qs,
+    const float *__restrict__ sc, float *__restrict__ y,
+    int ne0, int ne1, int ncols)
+{
+    const int BM = 128, BN = 64, BK = 32, TM = 8, TN = 4;
+    __shared__ int8_t As[BM][BK];
+    __shared__ int8_t Bs[BN][BK];
+    __shared__ float sA[BM];
+    __shared__ float sB[BN];
+
+    const int tid = threadIdx.x;
+    const int tr = tid / (BN / TN); // 0..15
+    const int tc = tid % (BN / TN); // 0..15
+    const int r0 = blockIdx.x * BM;
+    const int c0 = blockIdx.y * BN;
+    const int nb = ne0 / 32;
+
+    float acc[TM][TN];
+    for (int i = 0; i < TM; ++i)
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+
+    for (int blk = 0; blk < nb; ++blk) {
+        for (int i = tid; i < BM * 32; i += 256) {
+            const int r = i / 32, d = i % 32, rr = r0 + r;
+            int8_t v = 0;
+            float scv = 0.0f;
+            if (rr < ne1) {
+                const uint8_t *pb = w + ((size_t)rr * nb + blk) * 36;
+                v = (int8_t)pb[4 + d];
+                if (d == 0) scv = __half2float(*(const __half *)pb);
+            }
+            As[r][d] = v;
+            if (d == 0) sA[r] = scv;
+        }
+        for (int i = tid; i < BN * 32; i += 256) {
+            const int c = i / 32, d = i % 32, cc = c0 + c;
+            int8_t v = 0;
+            float scv = 0.0f;
+            if (cc < ncols) {
+                v = qs[(size_t)cc * ne0 + blk * 32 + d];
+                if (d == 0) scv = sc[(size_t)cc * nb + blk];
+            }
+            Bs[c][d] = v;
+            if (d == 0) sB[c] = scv;
+        }
+        __syncthreads();
+
+        int iacc[TM][TN];
+        for (int i = 0; i < TM; ++i)
+            for (int j = 0; j < TN; ++j) iacc[i][j] = 0;
+        for (int w4 = 0; w4 < 8; ++w4) {
+            int au[TM], bu[TN];
+            for (int i = 0; i < TM; ++i) au[i] = *(const int *)&As[tr * TM + i][w4 * 4];
+            for (int j = 0; j < TN; ++j) bu[j] = *(const int *)&Bs[tc * TN + j][w4 * 4];
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j) iacc[i][j] = __dp4a(au[i], bu[j], iacc[i][j]);
+        }
+        for (int i = 0; i < TM; ++i) {
+            const float sa = sA[tr * TM + i];
+            for (int j = 0; j < TN; ++j)
+                acc[i][j] += sa * sB[tc * TN + j] * (float)iacc[i][j];
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM; ++i) {
+        const int r = r0 + tr * TM + i;
+        if (r < ne1)
+            for (int j = 0; j < TN; ++j) {
+                const int c = c0 + tc * TN + j;
+                if (c < ncols) y[(size_t)c * ne1 + r] = acc[i][j];
+            }
+    }
+}
 // grid = (ceil(ne1/64), ceil(ncols/32)), block = (256,1,1). y[col][row].
 extern "C" __global__ void lg_q8_0_gemm_aligned(
     const uint8_t *__restrict__ w, const float *__restrict__ x, float *__restrict__ y,
