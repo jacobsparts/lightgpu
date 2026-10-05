@@ -1560,8 +1560,10 @@ extern "C" __global__ void lg_attn_prefill_scores2(const float*__restrict__ q, c
     const int tc = tid % (BN/TN);
     const int i0 = blockIdx.y * BM;
     const int j0 = blockIdx.x * BN;
+    const int gq = h / (n_qh / n_kvh);   // kv head repeated n_qh/n_kvh times
+    const int ldk = n_kvh * hd;
     const float* qs = q + (size_t)i0*n_qh*hd + (size_t)h*hd;
-    const float* ks = k + (size_t)j0*n_qh*hd + (size_t)h*hd;
+    const float* ks = k + (size_t)j0*ldk   + (size_t)gq*hd;
     float acc[TM][TN];
     for(int a=0;a<TM;++a) for(int b=0;b<TN;++b) acc[a][b]=0.f;
     const int ntq_rem = ntq - i0, ntk_rem = ntk - j0;
@@ -1572,7 +1574,7 @@ extern "C" __global__ void lg_attn_prefill_scores2(const float*__restrict__ q, c
         }
         for(int j=tid; j<BN*BK; j+=256){
             const int c=j/BK, d=j%BK, jj=j0+c;
-            Bs[d][c] = (jj<ntk && db+d<hd) ? ks[(size_t)c*n_qh*hd + db + d] : 0.f;
+            Bs[d][c] = (jj<ntk && db+d<hd) ? ks[(size_t)c*ldk + db + d] : 0.f;
         }
         __syncthreads();
         for(int d=0; d<BK; ++d){
