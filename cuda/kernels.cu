@@ -1101,6 +1101,117 @@ extern "C" __global__ void lg_attn_gqa(
     }
 }
 
+// Split-K "flash-decode" attention for the decode step (ntq == 1).
+//
+// lg_attn_gqa is warp-per-(head,query-token): for decode that is only n_qh
+// warps (16 for the LM = 2 blocks on 20 SMs), each walking all ntk keys in
+// SERIAL. At ntk=1391 that is 85 ms/token across 36 layers - the entire decode
+// gap - for ~0.2 GFLOP of work. The fix is to split the key range across P
+// independent chunks, compute an online-softmax partial (m, l, acc) per chunk
+// in parallel, then combine: m = max(m_p), l = sum_p l_p*exp(m_p-m),
+// acc = sum_p acc_p*exp(m_p-m). The combine is associative, so this is the same
+// arithmetic up to f32 reassociation. grid = (P, n_qh), block = 32 (one warp).
+//
+// Precondition: ntq == 1 (one query token per decode step); mask (may be null)
+// is mask[tq*ntk + tk] = mask[tk] for tq=0.
+extern "C" __global__ void lg_attn_gqa_sk_p1(
+    const float *__restrict__ q, const float *__restrict__ k,
+    const float *__restrict__ v, const float *__restrict__ mask,
+    float *__restrict__ pm, float *__restrict__ pl, float *__restrict__ pa,
+    int hd, int n_qh, int n_kvh, int ntq, int ntk, int P, float scale)
+{
+    const int lane = threadIdx.x;
+    const int h = blockIdx.y;
+    const int p = blockIdx.x;
+    const int group = n_qh / n_kvh;
+    const int hkv = h / group;
+    const int dpl = (hd + 31) / 32;
+    const int chunk = (ntk + P - 1) / P;
+    const int lo = p * chunk;
+    const int hi = lo + chunk < ntk ? lo + chunk : ntk;
+
+    // q index tq = 0 (decode).
+    const float *qp = q + (size_t)h * hd;
+    float qreg[LA_DPL];
+    for (int i = 0; i < dpl; ++i) {
+        const int d = lane + 32 * i;
+        qreg[i] = (d < hd) ? qp[d] : 0.f;
+    }
+
+    float m = -INFINITY, l = 0.f, acc[LA_DPL];
+    for (int i = 0; i < dpl; ++i) acc[i] = 0.f;
+
+    for (int tk = lo; tk < hi; ++tk) {
+        const float *kp = k + ((size_t)tk * n_kvh + hkv) * hd;
+        float dot = 0.f;
+        for (int i = 0; i < dpl; ++i) {
+            const int d = lane + 32 * i;
+            if (d < hd) dot += qreg[i] * kp[d];
+        }
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        float s = dot * scale;
+        if (mask) s += mask[tk];
+        const float mnew = fmaxf(m, s);
+        const float corr = __expf(m - mnew);
+        const float pv = __expf(s - mnew);
+        l = l * corr + pv;
+        const float *vp = v + ((size_t)tk * n_kvh + hkv) * hd;
+        for (int i = 0; i < dpl; ++i) {
+            const int d = lane + 32 * i;
+            if (d < hd) acc[i] = acc[i] * corr + pv * vp[d];
+        }
+        m = mnew;
+    }
+
+    const size_t idx = (size_t)h * P + p;
+    if (lane == 0) {
+        pm[idx] = m;
+        pl[idx] = l;
+    }
+    for (int i = 0; i < dpl; ++i) {
+        const int d = lane + 32 * i;
+        if (d < hd) pa[idx * hd + d] = acc[i];
+    }
+}
+
+// Combine step: one warp per head over its P partials. Associative reduction
+// of the online-softmax state (m = max, then rescale every partial to the
+// global max and sum). grid = (n_qh), block = 32.
+extern "C" __global__ void lg_attn_gqa_sk_p2(
+    const float *__restrict__ pm, const float *__restrict__ pl,
+    const float *__restrict__ pa, float *__restrict__ out,
+    int hd, int n_qh, int P)
+{
+    const int lane = threadIdx.x;
+    const int h = blockIdx.x;
+    const int dpl = (hd + 31) / 32;
+
+    float m = -INFINITY;
+    for (int p = 0; p < P; ++p) {
+        const size_t idx = (size_t)h * P + p;
+        if (pl[idx] > 0.f) m = fmaxf(m, pm[idx]);
+    }
+    float l = 0.f, acc[LA_DPL];
+    for (int i = 0; i < dpl; ++i) acc[i] = 0.f;
+    for (int p = 0; p < P; ++p) {
+        const size_t idx = (size_t)h * P + p;
+        const float lp = pl[idx];
+        if (lp <= 0.f) continue;
+        const float e = __expf(pm[idx] - m);
+        l += lp * e;
+        for (int i = 0; i < dpl; ++i) {
+            const int d = lane + 32 * i;
+            if (d < hd) acc[i] += pa[idx * hd + d] * e;
+        }
+    }
+    const float inv = (l > 0.f) ? 1.f / l : 0.f;
+    float *op = out + (size_t)h * hd;
+    for (int i = 0; i < dpl; ++i) {
+        const int d = lane + 32 * i;
+        if (d < hd) op[d] = acc[i] * inv;
+    }
+}
+
 // Self-attention with K/V staged in shared memory (ViT and full prefill).
 // Identical arithmetic to lg_attn_gqa, but a block owns (head, W query tokens)
 // and reads each K/V element from DRAM once per block instead of once per query
