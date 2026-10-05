@@ -1544,6 +1544,109 @@ extern "C" __global__ void lg_attn_prefill_out(
 // ===========================================================================
 
 
+// ===== NEW scores GEMM: S[h][i][j] = scale*dot(q_i,k_j) + mask[i][j]
+// GEMM m=ntq(rows i) x n=ntk(cols j) x k=hd. BM=64 BN=64 BK=36 TM=4 TN=4, 256 thr.
+// All threads compute 4x4 outputs. Q/K staged to smem in float4 (d contiguous).
+extern "C" __global__ void lg_attn_prefill_scores2(const float*__restrict__ q, const float*__restrict__ k,
+    const float*__restrict__ mask, float*__restrict__ s,
+    int hd, int n_qh, int n_kvh, int ntq, int ntk, float scale)
+{
+    const int BM=64, BN=64, BK=36, TM=4, TN=4;
+    __shared__ float As[BK][BM+2];
+    __shared__ float Bs[BK][BN+2];
+    const int h = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int tr = tid / (BN/TN);
+    const int tc = tid % (BN/TN);
+    const int i0 = blockIdx.y * BM;
+    const int j0 = blockIdx.x * BN;
+    const float* qs = q + (size_t)i0*n_qh*hd + (size_t)h*hd;
+    const float* ks = k + (size_t)j0*n_qh*hd + (size_t)h*hd;
+    float acc[TM][TN];
+    for(int a=0;a<TM;++a) for(int b=0;b<TN;++b) acc[a][b]=0.f;
+    const int ntq_rem = ntq - i0, ntk_rem = ntk - j0;
+    for(int db=0; db<hd; db+=BK){
+        for(int i=tid; i<BM*BK; i+=256){
+            const int r=i/BK, d=i%BK, ii=i0+r;
+            As[d][r] = (ii<ntq && db+d<hd) ? qs[(size_t)r*n_qh*hd + db + d] : 0.f;
+        }
+        for(int j=tid; j<BN*BK; j+=256){
+            const int c=j/BK, d=j%BK, jj=j0+c;
+            Bs[d][c] = (jj<ntk && db+d<hd) ? ks[(size_t)c*n_qh*hd + db + d] : 0.f;
+        }
+        __syncthreads();
+        for(int d=0; d<BK; ++d){
+            float a[TM], b[TN];
+            for(int x=0;x<TM;++x) a[x]=As[d][tr*TM+x];
+            for(int y=0;y<TN;++y) b[y]=Bs[d][tc*TN+y];
+            for(int x=0;x<TM;++x) for(int y=0;y<TN;++y) acc[x][y]=fmaf(a[x],b[y],acc[x][y]);
+        }
+        __syncthreads();
+    }
+    for(int x=0;x<TM;++x){
+        const int i=i0+tr*TM+x;
+        if(i<ntq && x<ntq_rem){
+            for(int y=0;y<TN;++y){
+                const int j=j0+tc*TN+y;
+                if(j<ntk && y<ntk_rem){
+                    float v = acc[x][y]*scale;
+                    if(mask) v += mask[(size_t)i*ntk + j];
+                    s[((size_t)h*ntq + i)*ntk + j] = v;
+                }
+            }
+        }
+    }
+}
+
+// ===== NEW out GEMM (transposed-w): out[i][r] = sum_j p[i][j]*v[j][r]
+// rows r=hd (blockIdx.x), cols i=ntq (blockIdx.y), reduce j=ntk. BM=64 BN=64 BK=32 TM=4 TN=4.
+extern "C" __global__ void lg_attn_prefill_out2(const float*__restrict__ p, const float*__restrict__ v, float*__restrict__ out,
+    int hd, int n_qh, int n_kvh, int ntq, int ntk)
+{
+    const int BM=64, BN=64, BK=32, TM=4, TN=4;
+    __shared__ float As[BK][BM+2];
+    __shared__ float Bs[BK][BN+2];
+    const int h = blockIdx.z;
+    const int gq = h / (n_qh / n_kvh);
+    const int ldw = n_kvh * hd;
+    const int sy  = n_qh * hd;
+    const int tid = threadIdx.x;
+    const int tr = tid / (BN/TN);
+    const int tc = tid % (BN/TN);
+    const int r0 = blockIdx.x * BM;
+    const int i0 = blockIdx.y * BN;
+    float acc[TM][TN];
+    for(int a=0;a<TM;++a) for(int b=0;b<TN;++b) acc[a][b]=0.f;
+    const int ntiles = (ntk+BK-1)/BK;
+    for(int t=0;t<ntiles;++t){
+        for(int x=tid; x<BM*BK; x+=256){
+            const int r=x/BK, jj=x%BK, rr=r0+r, kidx=t*BK+jj;
+            As[jj][r] = (rr<hd && kidx<ntk) ? v[(size_t)kidx*ldw + gq*hd + rr] : 0.f;
+        }
+        for(int y=tid; y<BN*BK; y+=256){
+            const int c=y/BK, jj=y%BK, ii=i0+c, kidx=t*BK+jj;
+            Bs[jj][c] = (ii<ntq && kidx<ntk) ? p[((size_t)h*ntq + ii)*ntk + kidx] : 0.f;
+        }
+        __syncthreads();
+        for(int d=0; d<BK; ++d){
+            float a[TM], b[TN];
+            for(int x=0;x<TM;++x) a[x]=As[d][tr*TM+x];
+            for(int y=0;y<TN;++y) b[y]=Bs[d][tc*TN+y];
+            for(int x=0;x<TM;++x) for(int y=0;y<TN;++y) acc[x][y]=fmaf(a[x],b[y],acc[x][y]);
+        }
+        __syncthreads();
+    }
+    for(int x=0;x<TM;++x){
+        const int r=r0+tr*TM+x;
+        if(r<hd){
+            for(int y=0;y<TN;++y){
+                const int i=i0+tc*TN+y;
+                if(i<ntq) out[(size_t)i*sy + (size_t)h*hd + r] = acc[x][y];
+            }
+        }
+    }
+}
+
 // Linear on the row-major token layout: out[i*C_out + o] =
 // bias[o] + sum_c x[i*C_in + c] * w[o*C_in + c], accumulated in c order.
 // Tiled 16x16 with the shared-memory trick that makes the weight tile
