@@ -1667,6 +1667,88 @@ extern "C" __global__ void lg_attn_prefill_scores2(const float*__restrict__ q, c
     }
 }
 
+// Row statistics for softmax/PV fusion; ntk <= 8192, block = 256.
+extern "C" __global__ void lg_attn_prefill_stats(const float* s, float* stats, int ntq, int ntk) {
+    const float* row=s+((size_t)blockIdx.z*ntq+blockIdx.y)*ntk;
+    int tid=threadIdx.x;
+    float vals[32];
+    float m=-INFINITY;
+    #pragma unroll
+    for(int z=0;z<32;++z){int j=tid+z*256; vals[z]=j<ntk?row[j]:-INFINITY; m=fmaxf(m,vals[z]);}
+    // Keep the original reduction tree, so changing memory traffic does not
+    // change the denominator's floating-point association.
+    __shared__ float red[256];
+    red[tid]=m; __syncthreads();
+    for(int off=128;off>0;off>>=1){if(tid<off) red[tid]=fmaxf(red[tid],red[tid+off]); __syncthreads();}
+    m=red[0]; __syncthreads();
+    float l=0;
+    #pragma unroll
+    for(int z=0;z<32;++z){if(tid+z*256<ntk){vals[z]=__expf(vals[z]-m); l+=vals[z];}}
+    red[tid]=l; __syncthreads();
+    for(int off=128;off>0;off>>=1){if(tid<off) red[tid]+=red[tid+off]; __syncthreads();}
+    float inv=red[0]>0?1.f/red[0]:0.f;
+    if(tid==0){stats[((size_t)blockIdx.z*ntq+blockIdx.y)*2]=m;stats[((size_t)blockIdx.z*ntq+blockIdx.y)*2+1]=inv;}
+}
+
+extern "C" __global__ void lg_attn_prefill_out_softmax(const float*__restrict__ p, const float*__restrict__ stats, const float*__restrict__ v, float*__restrict__ out,
+    int hd, int n_qh, int n_kvh, int ntq, int ntk)
+{
+    const int BM=64, BN=64, BK=32, TM=4, TN=4;
+    __shared__ float As[BK][BM+2];
+    __shared__ float Bs[BK][BN+2];
+    const int h = blockIdx.z;
+    const int gq = h / (n_qh / n_kvh);
+    const int ldw = n_kvh * hd;
+    const int sy  = n_qh * hd;
+    const int tid = threadIdx.x;
+    const int tr = tid / (BN/TN);
+    const int tc = tid % (BN/TN);
+    const int r0 = blockIdx.x * BM;
+    const int i0 = blockIdx.y * BN;
+    float acc[TM][TN];
+    for(int a=0;a<TM;++a) for(int b=0;b<TN;++b) acc[a][b]=0.f;
+    const int ntiles = (ntk+BK-1)/BK;
+    for(int t=0;t<ntiles;++t){
+        for(int x=tid; x<BM*BK/4; x+=256){
+            const int r=4*(x%(BM/4)), jj=x/(BM/4), rr=r0+r, kidx=t*BK+jj;
+            float4 a=make_float4(0,0,0,0);
+            if(rr+3<hd && kidx<ntk && hd%4==0) a=*(const float4*)(v+(size_t)kidx*ldw+gq*hd+rr);
+            else for(int z=0;z<4;++z) if(rr+z<hd && kidx<ntk) ((float*)&a)[z]=v[(size_t)kidx*ldw+gq*hd+rr+z];
+            As[jj][r]=a.x; As[jj][r+1]=a.y; As[jj][r+2]=a.z; As[jj][r+3]=a.w;
+        }
+        for(int y=tid; y<BN*BK/4; y+=256){
+            const int c=y/(BK/4), jj=4*(y%(BK/4)), ii=i0+c, kidx=t*BK+jj;
+            float4 b=make_float4(0,0,0,0);
+            if(ii<ntq && kidx+3<ntk && ntk%4==0) b=*(const float4*)(p+((size_t)h*ntq+ii)*ntk+kidx);
+            else for(int z=0;z<4;++z) if(ii<ntq && kidx+z<ntk) ((float*)&b)[z]=p[((size_t)h*ntq+ii)*ntk+kidx+z];
+            float m=0,inv=0;
+            if(ii<ntq){m=stats[((size_t)h*ntq+ii)*2];inv=stats[((size_t)h*ntq+ii)*2+1];}
+            Bs[jj][c]=(kidx<ntk)?__expf(b.x-m)*inv:0;
+            Bs[jj+1][c]=(kidx+1<ntk)?__expf(b.y-m)*inv:0;
+            Bs[jj+2][c]=(kidx+2<ntk)?__expf(b.z-m)*inv:0;
+            Bs[jj+3][c]=(kidx+3<ntk)?__expf(b.w-m)*inv:0;
+        }
+        __syncthreads();
+        for(int d=0; d<BK; ++d){
+            float a[TM], b[TN];
+            for(int x=0;x<TM;++x) a[x]=As[d][tr*TM+x];
+            for(int y=0;y<TN;++y) b[y]=Bs[d][tc*TN+y];
+            for(int x=0;x<TM;++x) for(int y=0;y<TN;++y) acc[x][y]=fmaf(a[x],b[y],acc[x][y]);
+        }
+        __syncthreads();
+    }
+    for(int x=0;x<TM;++x){
+        const int r=r0+tr*TM+x;
+        if(r<hd){
+            for(int y=0;y<TN;++y){
+                const int i=i0+tc*TN+y;
+                if(i<ntq) out[(size_t)i*sy + (size_t)h*hd + r] = acc[x][y];
+            }
+        }
+    }
+}
+
+
 // ===== NEW out GEMM (transposed-w): out[i][r] = sum_j p[i][j]*v[j][r]
 // rows r=hd (blockIdx.x), cols i=ntq (blockIdx.y), reduce j=ntk. BM=64 BN=64 BK=32 TM=4 TN=4.
 extern "C" __global__ void lg_attn_prefill_out2(const float*__restrict__ p, const float*__restrict__ v, float*__restrict__ out,
