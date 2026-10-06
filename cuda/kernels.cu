@@ -1568,13 +1568,15 @@ extern "C" __global__ void lg_attn_prefill_scores2(const float*__restrict__ q, c
     for(int a=0;a<TM;++a) for(int b=0;b<TN;++b) acc[a][b]=0.f;
     const int ntq_rem = ntq - i0, ntk_rem = ntk - j0;
     for(int db=0; db<hd; db+=BK){
-        for(int i=tid; i<BM*BK; i+=256){
-            const int r=i/BK, d=i%BK, ii=i0+r;
-            As[d][r] = (ii<ntq && db+d<hd) ? qs[(size_t)r*n_qh*hd + db + d] : 0.f;
-        }
-        for(int j=tid; j<BN*BK; j+=256){
-            const int c=j/BK, d=j%BK, jj=j0+c;
-            Bs[d][c] = (jj<ntk && db+d<hd) ? ks[(size_t)c*ldk + db + d] : 0.f;
+        for(int x=tid; x<BM*(BK/4); x+=256){
+            const int r=x/(BK/4), d=4*(x%(BK/4));
+            float4 a=make_float4(0,0,0,0), b=a;
+            if(i0+r<ntq && db+d+3<hd && hd%4==0) a=*(const float4*)(qs+(size_t)r*n_qh*hd+db+d);
+            else for(int z=0;z<4;++z) if(i0+r<ntq && db+d+z<hd) ((float*)&a)[z]=qs[(size_t)r*n_qh*hd+db+d+z];
+            if(j0+r<ntk && db+d+3<hd && hd%4==0) b=*(const float4*)(ks+(size_t)r*ldk+db+d);
+            else for(int z=0;z<4;++z) if(j0+r<ntk && db+d+z<hd) ((float*)&b)[z]=ks[(size_t)r*ldk+db+d+z];
+            As[d][r]=a.x; As[d+1][r]=a.y; As[d+2][r]=a.z; As[d+3][r]=a.w;
+            Bs[d][r]=b.x; Bs[d+1][r]=b.y; Bs[d+2][r]=b.z; Bs[d+3][r]=b.w;
         }
         __syncthreads();
         for(int d=0; d<BK; ++d){
@@ -1621,13 +1623,19 @@ extern "C" __global__ void lg_attn_prefill_out2(const float*__restrict__ p, cons
     for(int a=0;a<TM;++a) for(int b=0;b<TN;++b) acc[a][b]=0.f;
     const int ntiles = (ntk+BK-1)/BK;
     for(int t=0;t<ntiles;++t){
-        for(int x=tid; x<BM*BK; x+=256){
-            const int r=x/BK, jj=x%BK, rr=r0+r, kidx=t*BK+jj;
-            As[jj][r] = (rr<hd && kidx<ntk) ? v[(size_t)kidx*ldw + gq*hd + rr] : 0.f;
+        for(int x=tid; x<BM*BK/4; x+=256){
+            const int r=4*(x%(BM/4)), jj=x/(BM/4), rr=r0+r, kidx=t*BK+jj;
+            float4 a=make_float4(0,0,0,0);
+            if(rr+3<hd && kidx<ntk && hd%4==0) a=*(const float4*)(v+(size_t)kidx*ldw+gq*hd+rr);
+            else for(int z=0;z<4;++z) if(rr+z<hd && kidx<ntk) ((float*)&a)[z]=v[(size_t)kidx*ldw+gq*hd+rr+z];
+            As[jj][r]=a.x; As[jj][r+1]=a.y; As[jj][r+2]=a.z; As[jj][r+3]=a.w;
         }
-        for(int y=tid; y<BN*BK; y+=256){
-            const int c=y/BK, jj=y%BK, ii=i0+c, kidx=t*BK+jj;
-            Bs[jj][c] = (ii<ntq && kidx<ntk) ? p[((size_t)h*ntq + ii)*ntk + kidx] : 0.f;
+        for(int y=tid; y<BN*BK/4; y+=256){
+            const int c=y/(BK/4), jj=4*(y%(BK/4)), ii=i0+c, kidx=t*BK+jj;
+            float4 b=make_float4(0,0,0,0);
+            if(ii<ntq && kidx+3<ntk && ntk%4==0) b=*(const float4*)(p+((size_t)h*ntq+ii)*ntk+kidx);
+            else for(int z=0;z<4;++z) if(ii<ntq && kidx+z<ntk) ((float*)&b)[z]=p[((size_t)h*ntq+ii)*ntk+kidx+z];
+            Bs[jj][c]=b.x; Bs[jj+1][c]=b.y; Bs[jj+2][c]=b.z; Bs[jj+3][c]=b.w;
         }
         __syncthreads();
         for(int d=0; d<BK; ++d){
@@ -1647,37 +1655,6 @@ extern "C" __global__ void lg_attn_prefill_out2(const float*__restrict__ p, cons
             }
         }
     }
-}
-
-// Linear on the row-major token layout: out[i*C_out + o] =
-// bias[o] + sum_c x[i*C_in + c] * w[o*C_in + c], accumulated in c order.
-// Tiled 16x16 with the shared-memory trick that makes the weight tile
-// readable as ws[tx][k] against xs[ty][k].
-extern "C" __global__ void lg_linear(
-    const float *__restrict__ x, const float *__restrict__ w,
-    const float *__restrict__ bias, float *__restrict__ out,
-    int rows, int c_in, int c_out)
-{
-    __shared__ float xs[16][17];
-    __shared__ float ws[16][17];
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int r0 = blockIdx.y * 16;
-    const int o0 = blockIdx.x * 16;
-    const int r = r0 + ty;
-    const int o = o0 + tx;
-    float acc = 0.0f;
-    for (int c0 = 0; c0 < c_in; c0 += 16) {
-        const int cx = c0 + tx;
-        xs[ty][tx] = (r < rows && cx < c_in) ? x[(size_t)r * c_in + cx] : 0.0f;
-        const int wr = o0 + ty;
-        const int wc = c0 + tx;
-        ws[ty][tx] = (wr < c_out && wc < c_in) ? w[(size_t)wr * c_in + wc] : 0.0f;
-        __syncthreads();
-        for (int k = 0; k < 16; ++k) acc += xs[ty][k] * ws[tx][k];
-        __syncthreads();
-    }
-    if (r < rows && o < c_out) out[(size_t)r * c_out + o] = acc + (bias ? bias[o] : 0.0f);
 }
 
 // ===========================================================================
