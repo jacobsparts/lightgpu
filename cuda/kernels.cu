@@ -1466,6 +1466,71 @@ extern "C" __global__ void lg_attn_prefill_softmax(
     for (int j = tid; j < ntk; j += LA_PF_SM_T) row[j] *= inv;
 }
 
+extern "C" __global__ void lg_attn_prefill_softmax_cached(float* s, int ntq, int ntk) {
+    if(ntk>8192){
+    const int h = blockIdx.z;
+    const int i = blockIdx.y;
+    float *row = s + ((size_t)h * ntq + i) * ntk;
+    const int tid = threadIdx.x;
+
+    __shared__ float red[LA_PF_SM_T];
+    float m = -INFINITY;   // as lg_attn_gqa: this file does not include math_constants.h
+    for (int j = tid; j < ntk; j += LA_PF_SM_T) m = fmaxf(m, row[j]);
+    red[tid] = m;
+    __syncthreads();
+    for (int off = LA_PF_SM_T / 2; off > 0; off >>= 1) {
+        if (tid < off) red[tid] = fmaxf(red[tid], red[tid + off]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+
+    // exp relative to the row max. The mask is additive (-FLT_MAX/4 on masked
+    // pairs), so a masked entry subtracts to exp(-FLT_MAX/4 - m) = 0 and drops
+    // out of both the numerator and the denominator - no special case needed.
+    float l = 0.0f;
+    for (int j = tid; j < ntk; j += LA_PF_SM_T) {
+        const float e = __expf(row[j] - m);
+        row[j] = e;
+        l += e;
+    }
+    red[tid] = l;
+    __syncthreads();
+    for (int off = LA_PF_SM_T / 2; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    l = red[0];
+    // A fully-masked row would give l == 0. A causal mask always leaves the
+    // diagonal unmasked so this is unreachable there, but 1/0 would put NaN in
+    // the residual and NaN is far harder to trace than a zero row.
+    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    for (int j = tid; j < ntk; j += LA_PF_SM_T) row[j] *= inv;
+
+        return;
+    }
+    float* row=s+((size_t)blockIdx.z*ntq+blockIdx.y)*ntk;
+    int tid=threadIdx.x;
+    float vals[32];
+    float m=-INFINITY;
+    #pragma unroll
+    for(int z=0;z<32;++z){int j=tid+z*256; vals[z]=j<ntk?row[j]:-INFINITY; m=fmaxf(m,vals[z]);}
+    // Keep the original reduction tree, so changing memory traffic does not
+    // change the denominator's floating-point association.
+    __shared__ float red[256];
+    red[tid]=m; __syncthreads();
+    for(int off=128;off>0;off>>=1){if(tid<off) red[tid]=fmaxf(red[tid],red[tid+off]); __syncthreads();}
+    m=red[0]; __syncthreads();
+    float l=0;
+    #pragma unroll
+    for(int z=0;z<32;++z){if(tid+z*256<ntk){vals[z]=__expf(vals[z]-m); l+=vals[z];}}
+    red[tid]=l; __syncthreads();
+    for(int off=128;off>0;off>>=1){if(tid<off) red[tid]+=red[tid+off]; __syncthreads();}
+    float inv=red[0]>0?1.f/red[0]:0.f;
+    #pragma unroll
+    for(int z=0;z<32;++z) if(tid+z*256<ntk) row[tid+z*256]=vals[z]*inv;
+}
+
 // Stage 3: out[h][i][d] = sum_j p[h][i][j] * v[j][gq][d], as a GEMM.
 // Transposed-w form: w[k][r] = v[(gq*hd)+k*ldw+r] (r = channel), x[c][k] =
 // p[h*ntq*ntk + c*ntk + k] (c = query, k = key), so out[c][r] = sum_k x[c][k] *
