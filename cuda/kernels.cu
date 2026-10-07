@@ -2018,6 +2018,112 @@ extern "C" __global__ void lg_quantize_q8_0(
 // k-block's 32 int8 weights and the staged activation are both read as aligned
 // 4-byte ints (8 int loads per block instead of 64 byte ops).
 // grid = (ceil(ne1/64), ceil(ncols/32)).
+extern "C" __global__ void lg_q8_0_gemm_down_v2(
+    const uint8_t *__restrict__ w, const int8_t *__restrict__ qs,
+    const float *__restrict__ sc, float *__restrict__ y,
+    int ne0, int ne1, int ncols)
+{
+    __shared__ int xs[32 * 8];
+    __shared__ int ws[64 * 8];
+    __shared__ float ds[64];
+    const int tid = threadIdx.x;
+    const int jl  = tid & 31;
+    const int cs  = tid >> 5;
+    const int j0  = blockIdx.x * 64;
+    const int c0  = blockIdx.y * 32;
+    const int nb  = ne0 / 32;
+
+    const int r0 = j0 + jl;
+    const int r1 = j0 + jl + 32;
+    const int cA = c0 + cs * 4;
+
+    const bool ur0 = r0 < ne1;
+    const bool ur1 = r1 < ne1;
+    const bool uc0 = cA + 0 < ncols, uc1 = cA + 1 < ncols;
+    const bool uc2 = cA + 2 < ncols, uc3 = cA + 3 < ncols;
+
+    const uint8_t *w0 = w + (size_t)r0 * nb * 36 + 4;
+    const uint8_t *w1 = w + (size_t)r1 * nb * 36 + 4;
+    const float *s0 = sc + (size_t)(cA + 0) * nb;
+    const float *s1 = sc + (size_t)(cA + 1) * nb;
+    const float *s2 = sc + (size_t)(cA + 2) * nb;
+    const float *s3 = sc + (size_t)(cA + 3) * nb;
+
+    float a00 = 0.f, a01 = 0.f, a02 = 0.f, a03 = 0.f;
+    float a10 = 0.f, a11 = 0.f, a12 = 0.f, a13 = 0.f;
+
+    for (int b = 0; b < nb; ++b) {
+        {
+            const int c = tid >> 3;
+            const int wd = tid & 7;
+            const int col = c0 + c;
+            int v4 = 0;
+            if (col < ncols) {
+                v4 = *reinterpret_cast<const int *>(qs + (size_t)col * ne0 + b * 32 + wd * 4);
+            }
+            xs[c * 8 + wd] = v4;
+        }
+        // Each 32-thread warp stages contiguous 32-byte q8 blocks for 4 rows.
+        for (int z=tid;z<64*8;z+=256){
+            int row=z/8, wd=z%8, rr=j0+row;
+            ws[z]=(rr<ne1)?*reinterpret_cast<const int*>(w+((size_t)rr*nb+b)*36+4+wd*4):0;
+            if(wd==0)ds[row]=(rr<ne1)?__half2float(*reinterpret_cast<const __half*>(w+((size_t)rr*nb+b)*36)):0;
+        }
+        __syncthreads();
+
+        const int *xc0 = &xs[(cs * 4 + 0) * 8];
+        const int *xc1 = &xs[(cs * 4 + 1) * 8];
+        const int *xc2 = &xs[(cs * 4 + 2) * 8];
+        const int *xc3 = &xs[(cs * 4 + 3) * 8];
+        const uint8_t *p0 = w0 + (size_t)b * 36;
+        const uint8_t *p1 = w1 + (size_t)b * 36;
+        const float d0 = ds[jl];
+        const float d1 = ds[jl + 32];
+
+        int i00 = 0, i01 = 0, i02 = 0, i03 = 0, i10 = 0, i11 = 0, i12 = 0, i13 = 0;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int x0 = xc0[t];
+            const int x1 = xc1[t];
+            const int x2 = xc2[t];
+            const int x3 = xc3[t];
+            const int u0 = ws[jl*8+t];
+            const int u1 = ws[(jl+32)*8+t];
+            i00 = __dp4a(u0, x0, i00); i01 = __dp4a(u0, x1, i01);
+            i02 = __dp4a(u0, x2, i02); i03 = __dp4a(u0, x3, i03);
+            i10 = __dp4a(u1, x0, i10); i11 = __dp4a(u1, x1, i11);
+            i12 = __dp4a(u1, x2, i12); i13 = __dp4a(u1, x3, i13);
+        }
+        if (ur0) {
+            if (uc0) a00 += d0 * s0[b] * (float)i00;
+            if (uc1) a01 += d0 * s1[b] * (float)i01;
+            if (uc2) a02 += d0 * s2[b] * (float)i02;
+            if (uc3) a03 += d0 * s3[b] * (float)i03;
+        }
+        if (ur1) {
+            if (uc0) a10 += d1 * s0[b] * (float)i10;
+            if (uc1) a11 += d1 * s1[b] * (float)i11;
+            if (uc2) a12 += d1 * s2[b] * (float)i12;
+            if (uc3) a13 += d1 * s3[b] * (float)i13;
+        }
+        __syncthreads();
+    }
+    if (ur0) {
+        if (uc0) y[(size_t)(cA + 0) * ne1 + r0] = a00;
+        if (uc1) y[(size_t)(cA + 1) * ne1 + r0] = a01;
+        if (uc2) y[(size_t)(cA + 2) * ne1 + r0] = a02;
+        if (uc3) y[(size_t)(cA + 3) * ne1 + r0] = a03;
+    }
+    if (ur1) {
+        if (uc0) y[(size_t)(cA + 0) * ne1 + r1] = a10;
+        if (uc1) y[(size_t)(cA + 1) * ne1 + r1] = a11;
+        if (uc2) y[(size_t)(cA + 2) * ne1 + r1] = a12;
+        if (uc3) y[(size_t)(cA + 3) * ne1 + r1] = a13;
+    }
+}
+
+
+
 extern "C" __global__ void lg_q8_0_gemm_dp4a(
     const uint8_t *__restrict__ w, const int8_t *__restrict__ qs,
     const float *__restrict__ sc, float *__restrict__ y,
