@@ -2230,7 +2230,7 @@ extern "C" __global__ void lg_q8_0_gemm_square_v2(
 
 
 
-extern "C" __global__ __launch_bounds__(256,4) void lg_q8_0_gemm_up_v2(
+extern "C" __global__ void lg_q8_0_gemm_up_v2(
     const uint8_t *__restrict__ w, const int8_t *__restrict__ qs,
     const float *__restrict__ sc, float *__restrict__ y,
     int ne0, int ne1, int ncols)
