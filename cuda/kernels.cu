@@ -2018,21 +2018,6 @@ extern "C" __global__ void lg_quantize_q8_0(
 // k-block's 32 int8 weights and the staged activation are both read as aligned
 // 4-byte ints (8 int loads per block instead of 64 byte ops).
 // grid = (ceil(ne1/64), ceil(ncols/32)).
-extern "C" __global__ void lg_q8_0_gemm_v2(const uint8_t*w,const int8_t*qs,const float*sc,float*y,int ne0,int ne1,int ncols){
- const int BM=16,BN=64,BK=32,TM=4; __shared__ int8_t A[BM][BK],B[BN][BK]; __shared__ float sa[BM],sb[BN];
- int tid=threadIdx.x,tr=tid/BN,tc=tid%BN,r0=blockIdx.x*BM,c0=blockIdx.y*BN,nb=ne0/32; float acc[TM]={0,0,0,0};
- for(int blk=0;blk<nb;blk++){
-  for(int z=tid;z<BM*BK;z+=256){int r=z/BK,d=z%BK,rr=r0+r;int8_t v=0;float q=0;if(rr<ne1){const uint8_t*p=w+((size_t)rr*nb+blk)*36;v=(int8_t)p[4+d];if(!d)q=__half2float(*(const __half*)p);}A[r][d]=v;if(!d)sa[r]=q;}
-  for(int z=tid;z<BN*BK;z+=256){int c=z/BK,d=z%BK,cc=c0+c;int8_t v=0;float q=0;if(cc<ncols){v=qs[(size_t)cc*ne0+blk*32+d];if(!d)q=sc[(size_t)cc*nb+blk];}B[c][d]=v;if(!d)sb[c]=q;}
-  __syncthreads();int ia[TM]={0,0,0,0};
-  for(int w4=0;w4<8;w4++){int x=*(const int*)&B[tc][w4*4];for(int i=0;i<TM;i++)ia[i]=__dp4a(*(const int*)&A[tr*TM+i][w4*4],x,ia[i]);}
-  for(int i=0;i<TM;i++)acc[i]+=sa[tr*TM+i]*sb[tc]*(float)ia[i];
-  __syncthreads();
- }
- for(int i=0;i<TM;i++){int r=r0+tr*TM+i;if(r<ne1&&c0+tc<ncols)y[(size_t)(c0+tc)*ne1+r]=acc[i];}
-}
-
-
 extern "C" __global__ void lg_q8_0_gemm_dp4a(
     const uint8_t *__restrict__ w, const int8_t *__restrict__ qs,
     const float *__restrict__ sc, float *__restrict__ y,
