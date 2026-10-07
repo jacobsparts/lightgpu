@@ -2019,7 +2019,7 @@ extern "C" __global__ void lg_quantize_q8_0(
 // 4-byte ints (8 int loads per block instead of 64 byte ops).
 // grid = (ceil(ne1/64), ceil(ncols/32)).
 extern "C" __global__ void lg_q8_0_gemm_v2(const uint8_t*w,const int8_t*qs,const float*sc,float*y,int ne0,int ne1,int ncols){
- const int BM=64,BN=64,BK=32,TM=4; __shared__ int8_t A[BM][BK],B[BN][BK]; __shared__ float sa[BM],sb[BN];
+ const int BM=16,BN=64,BK=32,TM=4; __shared__ int8_t A[BM][BK],B[BN][BK]; __shared__ float sa[BM],sb[BN];
  int tid=threadIdx.x,tr=tid/BN,tc=tid%BN,r0=blockIdx.x*BM,c0=blockIdx.y*BN,nb=ne0/32; float acc[TM]={0,0,0,0};
  for(int blk=0;blk<nb;blk++){
   for(int z=tid;z<BM*BK;z+=256){int r=z/BK,d=z%BK,rr=r0+r;int8_t v=0;float q=0;if(rr<ne1){const uint8_t*p=w+((size_t)rr*nb+blk)*36;v=(int8_t)p[4+d];if(!d)q=__half2float(*(const __half*)p);}A[r][d]=v;if(!d)sa[r]=q;}
