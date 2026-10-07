@@ -2327,30 +2327,6 @@ extern "C" __global__ void lg_q8_0_gemm_up_v2(
 }
 
 
-extern "C" __global__ void lg_q8_0_gemm_mmq64(const uint8_t *__restrict__ w,const int8_t *__restrict__ qs,const float *__restrict__ sc,float *__restrict__ y,int ne0,int ne1,int ncols){
- const int tid=threadIdx.x, tr=tid/8, tc=tid%8, r0=blockIdx.x*64, c0=blockIdx.y*64, nb=ne0/32;
- __shared__ int xs[64*8], ws[64*8]; __shared__ float ds[64]; float acc[2][8];
- #pragma unroll
- for(int z=0;z<16;z++)((float*)acc)[z]=0;
- for(int b=0;b<nb;b++){
-  for(int z=tid;z<64*8;z+=256){int c=z/8,d=z%8,cc=c0+c; xs[z]=(cc<ncols)?*(const int*)(qs+(size_t)cc*ne0+b*32+d*4):0;}
-  for(int z=tid;z<64*8;z+=256){int r=z/8,d=z%8,rr=r0+r;const uint8_t*p=(rr<ne1)?w+((size_t)rr*nb+b)*36:nullptr;ws[z]=(p)?*(const int*)(p+4+d*4):0;if(d==0)ds[r]=(p)?__half2float(*(const __half*)p):0;}
-  __syncthreads();
-  #pragma unroll
-  for(int i=0;i<2;i++){const float d=ds[tr*2+i];
-#pragma unroll
-   for(int j=0;j<8;j++){int dot=0;
-#pragma unroll
-    for(int t=0;t<8;t++)dot=__dp4a(ws[(tr*2+i)*8+t],xs[(tc*8+j)*8+t],dot);
-    if(tr*2+i<64&&tc*8+j<64)acc[i][j]+=d*sc[(size_t)(c0+tc*8+j)*nb+b]*(float)dot;
-   }
-  }
-  __syncthreads();
- }
- for(int i=0;i<2;i++){int r=r0+tr*2+i;if(r<ne1)for(int j=0;j<8;j++){int c=c0+tc*8+j;if(c<ncols)y[(size_t)c*ne1+r]=acc[i][j];}}
-}
-
-
 extern "C" __global__ void lg_q8_0_gemm_dp4a(
     const uint8_t *__restrict__ w, const int8_t *__restrict__ qs,
     const float *__restrict__ sc, float *__restrict__ y,
